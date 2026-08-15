@@ -1,0 +1,210 @@
+name: Container image
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.lock
+      - Cargo.toml
+      - src/**
+      - crates/**
+      - .github/workflows/container.yml
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/hydradb
+
+jobs:
+  # Both architectures build on a native runner rather than one runner emulating
+  # the other through QEMU. This is a `cargo build --release` of the whole graph
+  # node against GraphBLAS and libcypher-parser; it takes ~11 minutes natively,
+  # and under emulation it runs long enough to threaten the job timeout. The
+  # arm64 runners are free for public repositories, so the matrix costs wall
+  # clock time only up to the slower of the two arches.
+  verify:
+    name: Verify production image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            pair: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            pair: linux-arm64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build production image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          push: false
+          cache-from: type=gha,scope=container-${{ matrix.pair }}
+          cache-to: type=gha,mode=max,scope=container-${{ matrix.pair }}
+
+  # Each arch pushes an anonymous, digest-only image; the `merge` job below is
+  # what binds those digests to the release tags. Splitting it this way is what
+  # lets the two builds run on different machines — a single build-push-action
+  # step emitting both platforms would have to run them on one runner.
+  build:
+    name: Build release image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            pair: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            pair: linux-arm64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          provenance: true
+          sbom: true
+          # Shares the scope the pull-request builds populate, so a release tag
+          # reuses the dependency layer its own PR already compiled.
+          cache-from: type=gha,scope=container-${{ matrix.pair }}
+          cache-to: type=gha,mode=max,scope=container-${{ matrix.pair }}
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest='${{ steps.build.outputs.digest }}'
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digests-${{ matrix.pair }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # `imagetools create` assembles one manifest list from the per-arch digests and
+  # applies every release tag to it. Each source digest is an index carrying that
+  # arch's provenance and SBOM attestations, and imagetools copies those children
+  # across, so the published tags keep the attestations the single-arch build had.
+  merge:
+    name: Publish release image
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          # `latest=auto` moves the tag only for a stable semver release. The
+          # previous `type=raw,value=latest` was unconditional, and this workflow
+          # fires on every `v*` tag, so tagging a v0.2.0-rc1 would have pointed
+          # `latest` — what a bare `docker pull` resolves to — at a release
+          # candidate. The semver patterns below already skip pre-releases.
+          flavor: |
+            latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      # A publish that silently loses an architecture is the exact failure this
+      # workflow exists to prevent, and it is invisible until someone pulls on
+      # the missing one. Assert the platform set rather than printing it. The
+      # provenance and SBOM manifests report `unknown/unknown` and are filtered
+      # out so they cannot be mistaken for a platform.
+      - name: Verify published manifest covers both platforms
+        run: |
+          image="${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
+          docker buildx imagetools inspect "$image"
+
+          published=$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}' \
+            | jq -r '.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"' \
+            | sort -u)
+          echo "Published platforms: $(echo "$published" | tr '\n' ' ')"
+
+          for expected in linux/amd64 linux/arm64; do
+            if ! grep -qxF "$expected" <<<"$published"; then
+              echo "::error::$image does not include $expected"
+              exit 1
+            fi
+          done

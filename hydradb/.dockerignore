@@ -1,0 +1,22 @@
+.git
+.cargo/config.toml
+.github
+.idea
+.vscode
+target
+*.csv
+*.log
+*.svg
+*.txt
+
+# Prose and operator assets. None of it is compiled — nothing in the tree uses
+# include_str!/include_bytes! — but everything here lands in the build context,
+# so without these entries editing a book or a Grafana dashboard changes the
+# COPY layer and forces the application build to run again.
+books
+docs
+notes
+grafana
+interactive
+charts
+scripts

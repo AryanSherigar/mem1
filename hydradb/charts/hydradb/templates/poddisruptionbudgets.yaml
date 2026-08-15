@@ -1,0 +1,39 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "hydradb.fullname" . }}-node
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  {{- if ne .Values.podDisruptionBudget.node.maxUnavailable nil }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.node.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.podDisruptionBudget.node.minAvailable }}
+  {{- end }}
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "hydradb.componentLabels" (dict "root" . "component" "node") | nindent 6 }}
+{{- end }}
+{{- if and .Values.podDisruptionBudget.enabled .Values.indexer.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "hydradb.fullname" . }}-indexer
+  labels:
+    {{- include "hydradb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: indexer
+spec:
+  {{- if ne .Values.podDisruptionBudget.indexer.maxUnavailable nil }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.indexer.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.podDisruptionBudget.indexer.minAvailable }}
+  {{- end }}
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "hydradb.componentLabels" (dict "root" . "component" "indexer") | nindent 6 }}
+{{- end }}

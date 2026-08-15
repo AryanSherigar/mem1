@@ -1,0 +1,246 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: 525753068359.dkr.ecr.us-east-1.amazonaws.com/staging/hydradb
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+objectStore:
+  cloudProvider: aws
+  aws:
+    bucketName: ""
+    region: us-east-1
+    allowHttp: false
+    endpoint: ""
+    endpointEgressTo: []
+
+graph:
+  namespace: production
+  graphId: default
+  database: default
+  cells:
+    - cell-0
+  dataPath: slatedb-graph/data
+
+auth:
+  existingSecret: ""
+  secretKey: auth-token
+  create: true
+  token: ""
+  preserveGeneratedToken: true
+  externalSecret:
+    enabled: false
+    targetSecretName: ""
+    refreshInterval: 1h
+    secretStoreRef:
+      kind: ClusterSecretStore
+      name: ""
+    remoteRef:
+      key: slatedb-graph/client-auth
+      property: token
+
+tls:
+  public:
+    enabled: true
+    secretName: ""
+    additionalDnsNames: []
+    trustBundle:
+      enabled: false
+      name: ""
+      sourceSecretName: ""
+      sourceSecretKey: tls.crt
+      namespaceSelector: {}
+  certManager:
+    enabled: false
+    publicIssuerRef:
+      group: cert-manager.io
+      kind: ClusterIssuer
+      name: ""
+    publicDuration: 2160h
+    publicRenewBefore: 360h
+
+node:
+  replicaCount: 1
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 60
+  updateStrategy: RollingUpdate
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+      ephemeral-storage: 12Gi
+    limits:
+      cpu: "8"
+      memory: 16Gi
+      ephemeral-storage: 24Gi
+  cache:
+    type: emptyDir
+    memoryLimitBytes: 8589934592
+    emptyDir:
+      sizeLimit: 20Gi
+      medium: ""
+    persistentVolume:
+      size: 40Gi
+      storageClassName: ""
+      accessModes:
+        - ReadWriteOnce
+      annotations: {}
+  tmpSizeLimit: 1Gi
+  affinity: {}
+  topologySpreadConstraints: []
+  tolerations: []
+  nodeSelector: {}
+  extraEnv: []
+
+indexer:
+  enabled: true
+  replicaCount: 1
+  intervalMs: 5000
+  retainPreviousGenerations: 1
+  # "full" preserves the pre-incremental behavior. Set "incremental" after
+  # validating the workload; unavailable or oversized WAL tails still fall
+  # back to a full rebuild.
+  buildMode: full
+  # Small indexes can be cheaper to rebuild from the block cache. Incremental
+  # mode uses the full path below this current-generation edge count.
+  incrementalMinEdges: 250000
+  # Number of graph scopes opened and indexed concurrently. Work is committed
+  # to a durable progress cursor in batches of this size.
+  scopeConcurrency: 8
+  # Maximum total scopes processed by one scheduler cycle. Recently changed
+  # cached scopes consume at most one quarter of this budget; the remainder
+  # advances the durable fair-scan cursor.
+  scopesPerCycle: 256
+  # Maximum read-only scope handles retained between indexing cycles. Reusing
+  # a hot handle avoids replaying the same durable SlateDB WAL. Idle one-time
+  # scan readers are closed instead of polluting this cache. Must be at least
+  # scopeConcurrency.
+  maxOpenScopes: 128
+  # Keep serving readiness across isolated object-store failures. Consecutive
+  # failed bounded cycles at this threshold mark the Pod unready.
+  readinessFailureThreshold: 3
+  # Decline an incremental build when its immutable WAL span is larger than
+  # this and use the full snapshot build instead.
+  maxWalTailFiles: 4096
+  # Concurrent immutable WAL object reads and snapshot edge resolutions used
+  # by one incremental build.
+  walTailFetchConcurrency: 16
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 60
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+      ephemeral-storage: 2Gi
+    limits:
+      cpu: "8"
+      memory: 16Gi
+      ephemeral-storage: 8Gi
+  affinity: {}
+  topologySpreadConstraints: []
+  tolerations: []
+  nodeSelector: {}
+  extraEnv: []
+
+service:
+  advertisedBoltAddress: ""
+  bolt:
+    type: ClusterIP
+    port: 7687
+    annotations: {}
+    loadBalancerSourceRanges: []
+  https:
+    type: ClusterIP
+    port: 443
+    annotations: {}
+    loadBalancerSourceRanges: []
+  adminPort: 9090
+
+runtime:
+  rustLog: info,slatedb_graph_kernel=info
+  maxOpenScopes: 8
+  # Parallel immutable WAL reads used to establish or refresh a cold SlateDB
+  # reader. This bounds object-store fan-out independently for each open scope.
+  readerWalReplayConcurrency: 16
+  maxConcurrentQueries: 256
+  maxQueryScanEdges: 1000000
+  maxQueryRuntimeMs: 30000
+  maxServerCursors: 1024
+  maxCursorBufferBytes: 67108864
+  cursorTtlMs: 60000
+  maxBoltConnections: 4096
+  boltAuthenticationTimeoutMs: 30000
+  boltIdleTimeoutMs: 900000
+  boltMaxConnectionAgeMs: 3600000
+  defaultPageSize: 1024
+  gracefulShutdownMs: 30000
+  l0SstSizeBytes: 16777216
+  maxUnflushedBytes: 67108864
+  # Consolidate sparse durable writes before thousands of tiny WAL objects can
+  # accumulate. At the default replay concurrency, 128 is eight replay waves.
+  maxWalFlushesBeforeL0Flush: 128
+  l0FlushParallelism: 1
+  maxMatrixAdjacencies: 0
+  maxMatrixAdjacencyBytes: 0
+  maxGraphblasMatrices: 16
+  maxGraphblasBytes: 134217728
+  maxRelationshipRowsBytes: 8388608
+  maxSourceRelationshipRowsBytes: 8388608
+  maxRelationshipPropertyRowsBytes: 16777216
+  maxConcurrentHydrations: 2
+  maxConcurrentMatrixCompilations: 1
+  indexDiscoveryIntervalMs: 5000
+  # Durable S3 CAS ownership window. Nodes renew every one third of this value.
+  writerLeaseMs: 30000
+  trimMemoryAfterHydration: true
+
+podDisruptionBudget:
+  enabled: true
+  # maxUnavailable (when set) takes precedence over minAvailable per component.
+  # Prefer maxUnavailable: 1 for the quorum DB so only one member is voluntarily
+  # disrupted at a time (majority preserved during drains/upgrades).
+  node:
+    minAvailable: 1
+    maxUnavailable: null
+  indexer:
+    minAvailable: 1
+    maxUnavailable: null
+
+networkPolicy:
+  enabled: true
+  clientIngressFrom: []
+  httpsEgressTo: []
+  monitoringNamespaceSelector:
+    matchLabels:
+      graph.usecortex.io/monitoring-access: "true"
+  additionalEgress: []
+
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  scrapeTimeout: 5s
+  labels: {}
+
+tests:
+  enabled: true
+  image:
+    repository: curlimages/curl
+    tag: "8.14.1"
+    pullPolicy: IfNotPresent
+
+extraObjects: []
