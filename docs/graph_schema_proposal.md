@@ -110,7 +110,6 @@ Turn        — one per user/assistant message within a session
 Fact        — an atomic factual claim extracted from a turn
 Entity      — a resolved canonical entity (person, place, thing, topic)
 Alias       — an alternative surface form for an entity
-Question    — (optional, for evaluation tracking only)
 ```
 
 ### Relationship Types
