@@ -292,15 +292,9 @@ Both the extraction LLM prompt and any retrieval-side filters **must** use value
 
 > Full specification: [startup_hydration_id_generation.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/startup_hydration_id_generation.md)
 
-HydraDB requires `id` as a non-negative integer. IDs are generated via **content-addressable SHA-256 hashing** of a canonical semantic path (e.g., `session:{haystack_id}:{session_id}`), mapped into partitioned ranges:
-- Sessions: `1..999`
-- Turns: `1_000..99_999`
-- Facts: `100_000..999_999`
-- Entities: `1_000_000..9_999_999`
-- Aliases: `10_000_000..19_999_999`
-- Speaker entities (User/Assistant): `9_999_998`, `9_999_999`
+IDs are generated via **content-addressable SHA-256 or MD5 hashing** of a canonical semantic path (e.g., `session:{haystack_id}:{session_id}`) truncated to a UUID format string.
 
-This produces deterministic, reproducible IDs: the same input always generates the same graph.
+This guarantees perfect reproducibility without ever hitting an artificial ceiling or relying on sequential state.
 
 ---
 
@@ -432,10 +426,10 @@ graph LR
 ---
 
 ### Implementation Roadmap (Ready to Build)
-1. **`src/llm.py`** — Unified `LLMClient` class with JSON schema structured output support.
-2. **`src/embedding.py`** — In-memory `EmbeddingIndex` and `EntityNameIndex` (`all-MiniLM-L6-v2` + numpy).
-3. **`src/id_generator.py`** — Content-addressable SHA-256 integer ID partition generator.
-4. **`src/ingestion.py`** — Turn extraction, entity resolution (`EntityResolver`), and HydraDB Bolt Cypher writer.
-5. **`src/retrieval.py`** — Temporal pruning, semantic candidate seeding, `algo.MSpaths` graph expansion, hybrid scoring, abstention check.
-6. **`src/reader.py`** — Synthesis prompt assembly and answer generation.
-7. **`src/benchmark_runner.py`** — End-to-end evaluation harness looping over `longmemeval_s_cleaned.json` and exporting `predictions.jsonl`.
+1. **`src/core/llm_client.py`** — Unified `LLMClient` class with JSON schema structured output support.
+2. **`src/db/embedding_index.py`** — In-memory `EmbeddingIndex` and `EntityNameIndex` (`all-MiniLM-L6-v2` + numpy).
+3. **`src/core/id_generator.py`** — Content-addressable UUID format generator.
+4. **`src/memory/ingestion.py`** — Turn extraction and HydraDB Bolt Cypher writer coordination.
+5. **`src/memory/retrieval.py`** — Temporal pruning, semantic candidate seeding, `algo.MSpaths` graph expansion, hybrid scoring, abstention check.
+6. **`src/entities/resolver.py`** — Entity resolution (`EntityResolver`) and canonical matching.
+7. **`src/evaluation/benchmark_runner.py`** — End-to-end evaluation harness looping over `longmemeval_s_cleaned.json` and exporting `predictions.jsonl`.

@@ -4,15 +4,28 @@ This document provides strict, programmatic constraints and reference material f
 
 ## 1. Codebase Structure
 
-We are implementing the system in a highly consolidated, 5-file architecture:
+We are implementing the system using a modular, atomic file architecture suited for production scalability:
 
 ```text
 src/
-├── core.py              # Universal LLMClient, EmbeddingIndex (numpy), IdGenerator
-├── entity_resolver.py   # Canonical matching, Tier 2 semantic blocking, Tier 3 LLM disambiguation, MERGED_INTO logic
-├── memory_engine.py     # Core Product: add_turn_async(), search_memories(), generate_reply(), hydrate()
-├── interactive_chat.py  # CLI chat interface testing persistence
-└── benchmark_runner.py  # Evaluator over longmemeval_s_cleaned.json -> predictions.jsonl
+├── core/
+│   ├── llm_client.py         # Universal LLMClient class with structured output support
+│   ├── id_generator.py       # Content-addressable UUID generator
+│   └── config.py             # Environment configuration and model allocation
+├── db/
+│   ├── graph_client.py       # HydraDB Bolt Cypher writer and connections
+│   └── embedding_index.py    # In-memory EmbeddingIndex and EntityNameIndex (numpy)
+├── memory/
+│   ├── engine.py             # Core Product: add_turn_async(), search_memories(), generate_reply(), hydrate()
+│   ├── retrieval.py          # Temporal pruning, semantic seeding, algo.MSpaths
+│   └── distillation.py       # Semantic memory distillation and SUPERSEDES updates
+├── entities/
+│   ├── resolver.py           # Canonical matching and MERGED_INTO logic
+│   └── semantic_blocking.py  # Tier 2 semantic blocking and Tier 3 LLM disambiguation
+├── chat/
+│   └── interactive_chat.py   # CLI chat interface testing persistence
+└── evaluation/
+    └── benchmark_runner.py   # Evaluator over longmemeval_s_cleaned.json -> predictions.jsonl
 ```
 
 ## 2. HydraDB Cypher Constraints (Bolt 5.x)
@@ -25,26 +38,21 @@ You MUST NOT use the following Cypher features, as HydraDB does not support them
 - `WITH` aliasing or filtering.
 - Unbounded variable-length paths (e.g., `*` or `*1..`). MUST specify max (e.g., `*1..5`).
 - `ON CREATE` / `ON MATCH` inside `MERGE`.
-- Storing Float Arrays (Embeddings MUST live in `core.py`'s `EmbeddingIndex`).
+- Storing Float Arrays (Embeddings MUST live in `src/db/embedding_index.py`'s `EmbeddingIndex`).
 
-## 3. ID Generation Partitions
+## 3. ID Generation
 
-HydraDB requires `id` to be a non-negative integer (`i64`). IDs are content-addressable SHA-256 hashes mapped to partitions:
-
-* **Session**: `1 .. 1,000`
-* **Turn**: `1,000 .. 100,000`
-* **Fact**: `100,000 .. 1,000,000`
-* **Entity**: `1,000,000 .. 10,000,000`
-* **Alias**: `10,000,000 .. 20,000,000`
-* **Speaker (User)**: `9,999,999`
-* **Speaker (Assistant)**: `9,999,998`
+IDs are generated as UUID strings derived deterministically from a SHA-256 hash of the unique semantic path. This guarantees perfect reproducibility without ever hitting an artificial ceiling or relying on sequential state.
 
 Implementation snippet for ID generation:
 ```python
-import struct, hashlib
-def hash_to_range(path: str, start: int, end: int) -> int:
-    raw_u64 = struct.unpack(">Q", hashlib.sha256(path.encode()).digest()[:8])[0]
-    return start + (raw_u64 % (end - start))
+import hashlib
+import uuid
+
+def content_hash_uuid(semantic_path: str) -> str:
+    """Generate a deterministic UUID format string from a semantic path."""
+    digest = hashlib.sha256(semantic_path.encode("utf-8")).digest()
+    return str(uuid.UUID(bytes=digest[:16]))
 ```
 
 ## 4. Entity Types (Strict Enum)
@@ -91,7 +99,7 @@ class EntityResolutionBatch(BaseModel):
 
 ## 6. Retrieval Algorithm Constants
 
-When implementing `search_memories()` in `memory_engine.py`, strictly adhere to these constants:
+When implementing `search_memories()` in `src/memory/engine.py`, strictly adhere to these constants:
 - **Temporal Buffer**: `±2 days` (172,800 seconds) padding applied to inferred `[start, end]`.
 - **Semantic Seeding**: `top_k = 10` (return top 10 facts from `EmbeddingIndex`).
 - **Semantic/Structural Weights**: `SEMANTIC = 0.6`, `STRUCTURAL = 0.4`.

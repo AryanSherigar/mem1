@@ -8,7 +8,7 @@ Follow-up to [graph_schema_proposal.md](file:///home/aryan-sherigar/projects/hyd
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| **ID generation** | Content-addressable hash → integer | Same input always produces the same graph. Enables idempotent re-ingestion, diff-based debugging, and reproducible benchmark runs. |
+| **ID generation** | Content-addressable hash → UUID format string | Same input always produces the same graph. Enables idempotent re-ingestion, diff-based debugging, and reproducible benchmark runs. |
 | **Startup hydration** | Hydrate from HydraDB graph + re-embed | Graph is the single source of truth. No secondary disk cache to drift. ~6s cold start for 1,200 facts is acceptable. |
 | **Re-ingestion** | Full wipe and re-ingest | Clean slate on each run. No stale data from prior prompt versions. Simplifies development iteration. |
 | **Iteration speed** | Optimized for rapid prompt tuning | Expect multiple re-ingestion cycles during hackathon. Wipe-and-rebuild must be fast and reliable. |
@@ -25,35 +25,28 @@ Instead of sequential counters or random UUIDs, node IDs are derived from a **SH
 - **Collision-resistant**: SHA-256 truncated to 63 bits has a collision probability of ~1 in 4.6 × 10¹⁸. At our scale (~20K nodes), the birthday paradox gives a collision probability of ~4.3 × 10⁻¹¹ — negligible.
 - **Partition-aware**: The hash is mapped into the appropriate ID range via modular arithmetic within the partition.
 
-### Why Not Raw Truncated Hash?
+### Why UUID Format?
 
-HydraDB IDs are non-negative integers (Bolt 5.x `i64`, so `0..2^63-1`). A raw 64-bit hash could produce IDs across the full `0..2^63` range, which works but makes debugging hard — you can't tell at a glance whether an ID refers to a Session, Turn, Fact, or Entity. By mapping the hash into the established partition ranges, we preserve the visual debugging benefit of the original scheme while gaining determinism.
+Using a UUID format string derived from a hash (e.g. Session ID: `hash("haystack_1_session_5")`, Turn ID: `hash("haystack_1_session_5_turn_12")`) guarantees perfect reproducibility without ever hitting an artificial ceiling or relying on sequential state.
 
 ### Hash Function
 
 ```python
 import hashlib
-import struct
+import uuid
 
-def content_hash_id(semantic_path: str, range_start: int, range_end: int) -> int:
+def content_hash_uuid(semantic_path: str) -> str:
     """
-    Generate a deterministic integer ID from a semantic path string,
-    mapped into the specified partition range [range_start, range_end).
+    Generate a deterministic UUID format string from a semantic path string.
     
     Args:
         semantic_path: Unique string that canonically identifies this node.
-        range_start: Inclusive lower bound of the ID partition.
-        range_end: Exclusive upper bound of the ID partition.
     
     Returns:
-        Deterministic non-negative integer in [range_start, range_end).
+        Deterministic UUID format string.
     """
     digest = hashlib.sha256(semantic_path.encode("utf-8")).digest()
-    # Take the first 8 bytes as an unsigned 64-bit integer
-    raw = struct.unpack(">Q", digest[:8])[0]
-    # Map into the partition range
-    partition_size = range_end - range_start
-    return range_start + (raw % partition_size)
+    return str(uuid.UUID(bytes=digest[:16]))
 ```
 
 ### Semantic Path Definitions Per Node Type
@@ -75,90 +68,51 @@ The semantic path must be **unique within the graph** and **derivable solely fro
 > [!IMPORTANT]
 > **Entity path uses canonical_name + entity_type**, not the raw surface form. This means entities created via different surface forms (e.g., "Max" and "my dog" both resolving to canonical "max") produce the same ID — they're the same node. This is a feature: entity resolution that resolves to an existing canonical name naturally gets the correct ID without a lookup.
 
-### Partition Ranges (Updated)
+### No More Partitions Needed
 
-The ranges from [graph_schema_proposal.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/graph_schema_proposal.md) are retained, reinterpreted as hash-mapping targets:
-
-| Node Type | Range Start | Range End (exclusive) | Partition Size |
-|---|---|---|---|
-| Session | `1` | `1_000` | 999 |
-| Turn | `1_000` | `100_000` | 99,000 |
-| Fact | `100_000` | `1_000_000` | 900,000 |
-| Entity | `1_000_000` | `10_000_000` | 9,000,000 |
-| Alias | `10_000_000` | `20_000_000` | 10,000,000 |
-| Speaker | Fixed: `9_999_998` (User), `9_999_999` (Assistant) | — | 2 (hardcoded) |
-
-At our scale (~40 sessions, ~400 turns, ~1,200 facts, ~500 entities, ~1,000 aliases), the partition sizes give ample room — collision probability within any partition is vanishingly small.
+Because IDs are generated as UUID strings derived from SHA-256 hashes of the semantic paths, we no longer need to worry about integer partitions, artificial ceilings, or fixed speaker IDs. 
 
 ### Implementation: `IdGenerator` Class
 
 ```python
 import hashlib
-import struct
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class IdPartition:
-    range_start: int
-    range_end: int  # exclusive
-    
-    @property
-    def size(self) -> int:
-        return self.range_end - self.range_start
+import uuid
 
 
 class IdGenerator:
-    """Content-addressable, deterministic ID generator for HydraDB nodes."""
-    
-    PARTITIONS = {
-        "session":  IdPartition(1, 1_000),
-        "turn":     IdPartition(1_000, 100_000),
-        "fact":     IdPartition(100_000, 1_000_000),
-        "entity":   IdPartition(1_000_000, 10_000_000),
-        "alias":    IdPartition(10_000_000, 20_000_000),
-    }
-    
-    # Fixed speaker entity IDs
-    SPEAKER_USER = 9_999_998
-    SPEAKER_ASSISTANT = 9_999_999
+    """Content-addressable, deterministic UUID generator for HydraDB nodes."""
     
     @staticmethod
-    def _hash_to_range(semantic_path: str, partition: IdPartition) -> int:
+    def _hash_to_uuid(semantic_path: str) -> str:
         digest = hashlib.sha256(semantic_path.encode("utf-8")).digest()
-        raw = struct.unpack(">Q", digest[:8])[0]
-        return partition.range_start + (raw % partition.size)
+        return str(uuid.UUID(bytes=digest[:16]))
     
-    def session_id(self, haystack_id: str, session_id: str) -> int:
+    def session_id(self, haystack_id: str, session_id: str) -> str:
         path = f"session:{haystack_id}:{session_id}"
-        return self._hash_to_range(path, self.PARTITIONS["session"])
+        return self._hash_to_uuid(path)
     
-    def turn_id(self, haystack_id: str, session_id: str, turn_index: int, role: str) -> int:
+    def turn_id(self, haystack_id: str, session_id: str, turn_index: int, role: str) -> str:
         path = f"turn:{haystack_id}:{session_id}:{turn_index}:{role}"
-        return self._hash_to_range(path, self.PARTITIONS["turn"])
+        return self._hash_to_uuid(path)
     
     def fact_id(self, haystack_id: str, session_id: str, turn_index: int, 
-                fact_index: int, fact_text: str) -> int:
+                fact_index: int, fact_text: str) -> str:
         text_hash = hashlib.sha256(fact_text.encode("utf-8")).hexdigest()[:8]
         path = f"fact:{haystack_id}:{session_id}:{turn_index}:{fact_index}:{text_hash}"
-        return self._hash_to_range(path, self.PARTITIONS["fact"])
+        return self._hash_to_uuid(path)
     
-    def entity_id(self, haystack_id: str, canonical_name: str, entity_type: str) -> int:
+    def entity_id(self, haystack_id: str, canonical_name: str, entity_type: str) -> str:
         path = f"entity:{haystack_id}:{canonical_name}:{entity_type}"
-        return self._hash_to_range(path, self.PARTITIONS["entity"])
+        return self._hash_to_uuid(path)
     
     def alias_id(self, haystack_id: str, canonical_alias: str, 
-                 parent_entity_canonical: str) -> int:
+                 parent_entity_canonical: str) -> str:
         path = f"alias:{haystack_id}:{canonical_alias}:{parent_entity_canonical}"
-        return self._hash_to_range(path, self.PARTITIONS["alias"])
+        return self._hash_to_uuid(path)
     
-    def speaker_id(self, role: str) -> int:
-        if role == "user":
-            return self.SPEAKER_USER
-        elif role == "assistant":
-            return self.SPEAKER_ASSISTANT
-        else:
-            raise ValueError(f"Unknown speaker role: {role}")
+    def speaker_id(self, role: str) -> str:
+        # Speaker IDs are also deterministic UUIDs now based on role
+        return self._hash_to_uuid(f"speaker:{role}")
 ```
 
 ### Collision Detection (Safety Net)
@@ -170,9 +124,9 @@ class CollisionRegistry:
     """Tracks all generated IDs to detect hash collisions at ingestion time."""
     
     def __init__(self):
-        self._registry: dict[int, str] = {}  # id → semantic_path
+        self._registry: dict[str, str] = {}  # id → semantic_path
     
-    def register(self, node_id: int, semantic_path: str) -> None:
+    def register(self, node_id: str, semantic_path: str) -> None:
         if node_id in self._registry:
             existing_path = self._registry[node_id]
             if existing_path != semantic_path:
@@ -520,7 +474,7 @@ Because IDs are content-addressable:
 
 | Decision | Choice | Key Reason |
 |---|---|---|
-| ID generation | SHA-256 content hash → partitioned integer | Deterministic, reproducible, debuggable; same input always → same graph |
+| ID generation | SHA-256 content hash → UUID format string | Deterministic, reproducible, debuggable; same input always → same graph |
 | Semantic path format | `{type}:{haystack_id}:{unique_components}` | Unique within graph, derivable from source data, no runtime state |
 | Collision handling | Runtime `CollisionRegistry` check during ingestion | Safety net; probability is ~10⁻¹¹ at our scale but worth the 3 lines of code |
 | Startup hydration | Query HydraDB → batch re-embed | Graph is single source of truth; ~6-7s cold start is acceptable |
