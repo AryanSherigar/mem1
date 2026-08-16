@@ -1,0 +1,66 @@
+{
+  "adapter_fixture_note": {
+    "source_shape": {
+      "question_id": "fixture_longmem_001",
+      "haystack_session_ids": ["session-later", "session-earlier"],
+      "haystack_dates": ["2022/01/02 (Sun) 10:00", "2022/01/01 (Sat) 09:00"],
+      "haystack_sessions": [
+        [{"role": "assistant", "content": "Max sounds wonderful."}],
+        [{"role": "user", "content": "I adopted a dog named Max.", "has_answer": true}]
+      ],
+      "question_type": "single-session-user",
+      "answer": "Max",
+      "_abs": false
+    },
+    "excluded_from_canonical_output": [
+      "question_type",
+      "answer",
+      "has_answer",
+      "_abs"
+    ]
+  },
+  "contract_version": "v1",
+  "ingestion_id": "fixture-longmemeval-v1-run-001",
+  "context_id": "longmemeval:fixture_longmem_001",
+  "source_type": "longmemeval",
+  "source_external_id": "fixture_longmem_001",
+  "metadata": {
+    "source_empty_turn_count": 0
+  },
+  "records": [
+    {
+      "record_id": "session-earlier:source-0001:turn-0000",
+      "session_id": "session-earlier:source-0001",
+      "actor_role": "user",
+      "occurred_at": "2022-01-01T09:00:00Z",
+      "content_type": "text/plain",
+      "content": "I adopted a dog named Max.",
+      "metadata": {
+        "source_session_id": "session-earlier",
+        "source_occurred_at": "2022/01/01 (Sat) 09:00",
+        "source_time_precision": "minute",
+        "source_timezone": "unknown",
+        "timestamp_normalization": "assumed_utc_for_benchmark_ordering_only",
+        "source_index": 1,
+        "turn_index": 0
+      }
+    },
+    {
+      "record_id": "session-later:source-0000:turn-0000",
+      "session_id": "session-later:source-0000",
+      "actor_role": "assistant",
+      "occurred_at": "2022-01-02T10:00:00Z",
+      "content_type": "text/plain",
+      "content": "Max sounds wonderful.",
+      "metadata": {
+        "source_session_id": "session-later",
+        "source_occurred_at": "2022/01/02 (Sun) 10:00",
+        "source_time_precision": "minute",
+        "source_timezone": "unknown",
+        "timestamp_normalization": "assumed_utc_for_benchmark_ordering_only",
+        "source_index": 0,
+        "turn_index": 0
+      }
+    }
+  ]
+}

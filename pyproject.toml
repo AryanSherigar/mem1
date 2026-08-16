@@ -1,0 +1,9 @@
+[project]
+name = "context-memory"
+version = "0.1.0"
+description = "Generic context-memory ingestion domain contracts"
+requires-python = ">=3.12"
+dependencies = ["psycopg[binary]>=3.2,<4"]
+
+[tool.context-memory]
+contract-version = "v1"

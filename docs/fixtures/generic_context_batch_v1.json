@@ -1,0 +1,65 @@
+{
+  "contract_version": "v1",
+  "ingestion_id": "fixture-generic-context-v1-run-001",
+  "context_id": "fixture-user-001",
+  "source_type": "chat_export",
+  "source_external_id": "chat-export-001",
+  "records": [
+    {
+      "record_id": "session-a-turn-001",
+      "session_id": "session-a",
+      "actor_role": "user",
+      "occurred_at": "2026-01-10T09:00:00Z",
+      "content_type": "text/plain",
+      "content": "I adopted a dog named Max."
+    },
+    {
+      "record_id": "session-a-turn-002",
+      "session_id": "session-a",
+      "actor_role": "user",
+      "occurred_at": "2026-01-10T09:01:00Z",
+      "content_type": "text/plain",
+      "content": "I prefer tea over coffee."
+    },
+    {
+      "record_id": "session-b-turn-001",
+      "session_id": "session-b",
+      "actor_role": "assistant",
+      "occurred_at": "2026-02-01T10:00:00Z",
+      "content_type": "text/plain",
+      "content": "To reset the router, unplug it for thirty seconds, then reconnect it."
+    },
+    {
+      "record_id": "session-c-turn-001",
+      "session_id": "session-c",
+      "actor_role": "user",
+      "occurred_at": "2026-03-01T12:00:00Z",
+      "content_type": "text/plain",
+      "content": "Actually, Max is a labrador, not a golden retriever."
+    },
+    {
+      "record_id": "session-c-turn-002",
+      "session_id": "session-c",
+      "actor_role": "user",
+      "occurred_at": "2026-03-01T12:01:00Z",
+      "content_type": "text/plain",
+      "content": "We have a vet visit next Tuesday."
+    },
+    {
+      "record_id": "session-d-turn-001",
+      "session_id": "session-d",
+      "actor_role": "user",
+      "occurred_at": "2026-03-15T08:00:00Z",
+      "content_type": "text/plain",
+      "content": "Max needs a walk."
+    },
+    {
+      "record_id": "session-e-turn-001",
+      "session_id": "session-e",
+      "actor_role": "user",
+      "occurred_at": "2026-03-16T08:00:00Z",
+      "content_type": "text/plain",
+      "content": "Max needs a walk."
+    }
+  ]
+}

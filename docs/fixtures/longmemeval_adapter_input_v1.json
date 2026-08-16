@@ -1,0 +1,16 @@
+[
+  {
+    "question_id": "fixture_longmem_001",
+    "haystack_session_ids": ["session-later", "session-earlier"],
+    "haystack_dates": ["2022/01/02 (Sun) 10:00", "2022/01/01 (Sat) 09:00"],
+    "haystack_sessions": [
+      [{"role": "assistant", "content": "Max sounds wonderful."}],
+      [{"role": "user", "content": "I adopted a dog named Max.", "has_answer": true}]
+    ],
+    "question": "What is the dog's name?",
+    "question_type": "single-session-user",
+    "question_date": "2022/01/03 (Mon) 10:00",
+    "answer": "Max",
+    "answer_session_ids": ["session-earlier"]
+  }
+]

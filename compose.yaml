@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg16-bookworm
+    environment:
+      POSTGRES_DB: context_memory
+      POSTGRES_USER: context_memory
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:54329:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U context_memory -d context_memory"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

@@ -1,0 +1,26 @@
+[
+  {
+    "case": "unicode-semantic-session",
+    "record": "café 🐶 likes walks",
+    "draft": {"candidate_id": "fact-001", "source_start": 5, "source_end": 6},
+    "expected": {"memory_type": "semantic", "scope_type": "session", "accepted": true}
+  },
+  {
+    "case": "ordinary-language-is-not-procedural",
+    "record": "The user likes walks",
+    "draft": {"candidate_id": "fact-002", "source_start": 9, "source_end": 14},
+    "expected": {"memory_type": "semantic", "accepted": true}
+  },
+  {
+    "case": "explicit-procedure",
+    "record": "Walk the dog every morning",
+    "draft": {"candidate_id": "procedure-001", "memory_type": "procedural", "source_start": 0, "source_end": 24},
+    "expected": {"memory_type": "procedural", "accepted": true}
+  },
+  {
+    "case": "invalid-span",
+    "record": "short",
+    "draft": {"candidate_id": "reject-001", "source_start": 5, "source_end": 7},
+    "expected": {"accepted": false, "reason": "Unicode code-point span"}
+  }
+]
