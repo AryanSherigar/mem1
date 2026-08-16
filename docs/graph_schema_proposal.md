@@ -437,4 +437,6 @@ graph LR
 9. **`src/entities/resolver.py`** — Canonical matching and `MERGED_INTO` logic.
 10. **`src/entities/semantic_blocking.py`** — Tier 2 semantic blocking and Tier 3 LLM disambiguation.
 11. **`src/chat/interactive_chat.py`** — CLI chat interface testing persistence.
-12. **`src/evaluation/benchmark_runner.py`** — Evaluator over `longmemeval_s_cleaned.json` -> `predictions.jsonl`.
+12. **`src/api/server.py`** — FastAPI application and uvicorn runner.
+13. **`src/api/routes.py`** — HTTP REST endpoints (`POST /memory`, `GET /search`).
+14. **`src/evaluation/benchmark_runner.py`** — Evaluator over `longmemeval_s_cleaned.json` -> `predictions.jsonl`.

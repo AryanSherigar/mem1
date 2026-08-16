@@ -24,6 +24,9 @@ src/
 │   └── semantic_blocking.py  # Tier 2 semantic blocking and Tier 3 LLM disambiguation
 ├── chat/
 │   └── interactive_chat.py   # CLI chat interface testing persistence
+├── api/
+│   ├── server.py             # FastAPI application and uvicorn runner
+│   └── routes.py             # HTTP REST endpoints (POST /memory, GET /search)
 └── evaluation/
     └── benchmark_runner.py   # Evaluator over longmemeval_s_cleaned.json -> predictions.jsonl
 ```

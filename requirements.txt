@@ -1,0 +1,8 @@
+neo4j>=5.0.0
+openai>=1.0.0
+pydantic>=2.0.0
+sentence-transformers>=2.0.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
