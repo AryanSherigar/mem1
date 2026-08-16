@@ -426,10 +426,15 @@ graph LR
 ---
 
 ### Implementation Roadmap (Ready to Build)
-1. **`src/core/llm_client.py`** — Unified `LLMClient` class with JSON schema structured output support.
-2. **`src/db/embedding_index.py`** — In-memory `EmbeddingIndex` and `EntityNameIndex` (`all-MiniLM-L6-v2` + numpy).
-3. **`src/core/id_generator.py`** — Content-addressable UUID format generator.
-4. **`src/memory/ingestion.py`** — Turn extraction and HydraDB Bolt Cypher writer coordination.
-5. **`src/memory/retrieval.py`** — Temporal pruning, semantic candidate seeding, `algo.MSpaths` graph expansion, hybrid scoring, abstention check.
-6. **`src/entities/resolver.py`** — Entity resolution (`EntityResolver`) and canonical matching.
-7. **`src/evaluation/benchmark_runner.py`** — End-to-end evaluation harness looping over `longmemeval_s_cleaned.json` and exporting `predictions.jsonl`.
+1. **`src/core/llm_client.py`** — Universal `LLMClient` class with JSON schema structured output support.
+2. **`src/core/id_generator.py`** — Content-addressable UUID format generator.
+3. **`src/core/config.py`** — Environment configuration and model allocation.
+4. **`src/db/graph_client.py`** — HydraDB Bolt Cypher writer and connections.
+5. **`src/db/embedding_index.py`** — In-memory `EmbeddingIndex` and `EntityNameIndex` (`all-MiniLM-L6-v2` + numpy).
+6. **`src/memory/engine.py`** — Core Product: `add_turn_async()`, `search_memories()`, `generate_reply()`, `hydrate()`.
+7. **`src/memory/retrieval.py`** — Temporal pruning, semantic candidate seeding, `algo.MSpaths` graph expansion.
+8. **`src/memory/distillation.py`** — Semantic memory distillation and `SUPERSEDES` updates.
+9. **`src/entities/resolver.py`** — Canonical matching and `MERGED_INTO` logic.
+10. **`src/entities/semantic_blocking.py`** — Tier 2 semantic blocking and Tier 3 LLM disambiguation.
+11. **`src/chat/interactive_chat.py`** — CLI chat interface testing persistence.
+12. **`src/evaluation/benchmark_runner.py`** — Evaluator over `longmemeval_s_cleaned.json` -> `predictions.jsonl`.
