@@ -1,5 +1,7 @@
 # Graph Schema Proposal — LongMemEval Memory System on HydraDB
 
+Companion to [retrieval_architecture.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/retrieval_architecture.md), [semantic_memory_distillation.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/semantic_memory_distillation.md), [entity_resolution_strategy.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/entity_resolution_strategy.md), [startup_hydration_id_generation.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/startup_hydration_id_generation.md), [temporal_query_resolver.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/temporal_query_resolver.md), and [llm_model_config.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/llm_model_config.md).
+
 ## 1. HydraDB Grounding (Step 1 Confirmations)
 
 ### Connection
@@ -122,6 +124,7 @@ STATED_BY       Fact → Entity            (the speaker: "User" or "Assistant" e
 SUPERSEDES      Fact → Fact              (knowledge-update: newer fact replaces older)
 RELATES_TO      Entity → Entity          (general semantic link between entities)
 HAS_ALIAS       Entity → Alias           (alternative surface form for entity lookup)
+MERGED_INTO     Entity → Entity          (audit trail: source entity was merged into target)
 ```
 
 ### Schema as Cypher `CREATE` Statements
@@ -249,6 +252,7 @@ CREATE (e1:Entity {id: 2000})-[:RELATES_TO {relation: 'pet_of'}]->(e2:Entity {id
 | | `name` | `string` | Display name |
 | | `canonical_name` | `string` | Lowercased normalized name for matching |
 | | `entity_type` | `string` | **Fixed enum** — must be one of the values in the Entity Type Enum table below |
+| | `is_merged` | `boolean` | `true` if this entity was merged into another via entity resolution. Default `false`. |
 
 #### Entity Type Enum
 
@@ -280,10 +284,15 @@ Both the extraction LLM prompt and any retrieval-side filters **must** use value
 | `SUPERSEDES` | `superseded_at` | `int` | Epoch when the supersession was recorded |
 | `RELATES_TO` | `relation` | `string` | Semantic relation label (e.g., `'pet_of'`, `'works_at'`) |
 | `HAS_ALIAS` | *(none)* | — | Links entity to an alias surface form |
+| `MERGED_INTO` | `merged_at` | `int` | Epoch timestamp of the entity merge |
+| | `merge_reason` | `string` | `"exact_match"`, `"llm_confirmed"`, or `"manual"` |
+| | `confidence` | `string` | `"high"`, `"medium"`, or `"deterministic"` |
 
 ### ID Allocation Strategy
 
-HydraDB requires `id` as a non-negative integer. We use a partitioned scheme:
+> Full specification: [startup_hydration_id_generation.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/startup_hydration_id_generation.md)
+
+HydraDB requires `id` as a non-negative integer. IDs are generated via **content-addressable SHA-256 hashing** of a canonical semantic path (e.g., `session:{haystack_id}:{session_id}`), mapped into partitioned ranges:
 - Sessions: `1..999`
 - Turns: `1_000..99_999`
 - Facts: `100_000..999_999`
@@ -291,7 +300,7 @@ HydraDB requires `id` as a non-negative integer. We use a partitioned scheme:
 - Aliases: `10_000_000..19_999_999`
 - Speaker entities (User/Assistant): `9_999_998`, `9_999_999`
 
-This is adequate for `longmemeval_s` (~40 sessions × ~10 turns × ~3 facts/turn ≈ 1,200 facts, ~500 entities, ~1,000 aliases).
+This produces deterministic, reproducible IDs: the same input always generates the same graph.
 
 ---
 
@@ -409,11 +418,24 @@ graph LR
 
 ---
 
-## 9. Next Steps (Not Implemented Yet)
+## 9. Next Steps
 
-1. **Ingestion pipeline** — Python script that reads `longmemeval_s_cleaned.json`, calls LLM for fact extraction + entity resolution, and writes to HydraDB via Bolt
-2. **Retrieval pipeline** — Given a question, extract entities, query the graph, assemble context, call reader LLM for answer generation
-3. **Evaluation harness integration** — Output JSONL in the expected format and run `evaluate_qa.py`
-4. **ID allocation implementation** — Deterministic ID generator from session/turn/fact indices
+### Decided (Architecture Specification 100% Complete)
+1. ~~**ID allocation implementation**~~ → [startup_hydration_id_generation.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/startup_hydration_id_generation.md) — Content-addressable SHA-256 hash IDs
+2. ~~**Entity resolution strategy**~~ → [entity_resolution_strategy.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/entity_resolution_strategy.md) — 3-tier: Exact → Semantic blocking → Batched LLM
+3. ~~**Memory distillation pipeline**~~ → [semantic_memory_distillation.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/semantic_memory_distillation.md) — LLM-as-a-function extraction with ADD/UPDATE/DELETE
+4. ~~**Retrieval architecture**~~ → [retrieval_architecture.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/retrieval_architecture.md) — Semantic seeding + graph traversal + hybrid scoring
+5. ~~**Benchmark execution model**~~ — **Per-Question (Ephemeral)**: For each question $Q_i$, wipe the graph and indices, ingest $Q_i$'s haystack (~35 sessions, ~1,200 facts), run retrieval, generate the hypothesis, and append to `predictions.jsonl`.
+6. ~~**Temporal query resolver**~~ → [temporal_query_resolver.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/temporal_query_resolver.md) — Time-Aware Query Expansion with LLM date inference, ±2 days padding, and HydraDB epoch filters.
+7. ~~**LLM model selection & concurrency config**~~ → [llm_model_config.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/llm_model_config.md) — Fireworks AI (Llama 3.1 8B / 3.3 70B) + OpenRouter (Llama 3.3 70B / GPT-4o-mini judge) via universal OpenAI client.
 
-Awaiting review before proceeding to implementation.
+---
+
+### Implementation Roadmap (Ready to Build)
+1. **`src/llm.py`** — Unified `LLMClient` class with JSON schema structured output support.
+2. **`src/embedding.py`** — In-memory `EmbeddingIndex` and `EntityNameIndex` (`all-MiniLM-L6-v2` + numpy).
+3. **`src/id_generator.py`** — Content-addressable SHA-256 integer ID partition generator.
+4. **`src/ingestion.py`** — Turn extraction, entity resolution (`EntityResolver`), and HydraDB Bolt Cypher writer.
+5. **`src/retrieval.py`** — Temporal pruning, semantic candidate seeding, `algo.MSpaths` graph expansion, hybrid scoring, abstention check.
+6. **`src/reader.py`** — Synthesis prompt assembly and answer generation.
+7. **`src/benchmark_runner.py`** — End-to-end evaluation harness looping over `longmemeval_s_cleaned.json` and exporting `predictions.jsonl`.

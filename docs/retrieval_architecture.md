@@ -1,6 +1,6 @@
 # Hybrid Retrieval Architecture — Semantic Seeding + Graph Traversal
 
-Follow-up to [graph_schema_proposal.md](file:///home/aryan-sherigar/.gemini/antigravity-cli/brain/203a0cc1-b4d3-40f7-be5d-e8e73e65c45d/graph_schema_proposal.md).
+Follow-up to [graph_schema_proposal.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/graph_schema_proposal.md) and companion to [semantic_memory_distillation.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/semantic_memory_distillation.md).
 
 ---
 
