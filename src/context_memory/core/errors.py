@@ -15,3 +15,7 @@ class ImmutableRecordConflictError(ValueError):
 
 class GraphPayloadConflictError(ValueError):
     """Raised when one logical graph record is replayed with changed payload."""
+
+
+class IllegalJobTransitionError(ValueError):
+    """Raised when a job-state transition is not permitted by the M8 state contract."""

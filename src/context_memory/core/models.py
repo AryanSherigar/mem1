@@ -314,22 +314,53 @@ class Chunk:
         _metadata(self.metadata, "chunk.metadata")
 
 
+SUBJECT_KINDS = frozenset({"fact", "chunk"})
+
+
 @dataclass(frozen=True)
 class Embedding:
+    """Versioned semantic embedding for a fact or chunk (Milestone 7, ADR-013/ADR-027)."""
+
+    context_id: str
+    subject_kind: str
     subject_id: str
+    source_chunk_id: str
     model_name: str
     model_version: str
     values: tuple[float, ...]
+    embedded_content_hash: str
+    is_active: bool = True
+
+    def __post_init__(self) -> None:
+        _required_text(self.context_id, "embedding.context_id")
+        if self.subject_kind not in SUBJECT_KINDS:
+            raise ContractValidationError("embedding.subject_kind", "must be 'fact' or 'chunk'")
+        _required_text(self.subject_id, "embedding.subject_id")
+        _required_text(self.source_chunk_id, "embedding.source_chunk_id")
+        _required_text(self.model_name, "embedding.model_name")
+        _required_text(self.model_version, "embedding.model_version")
+        if not self.values or not all(isinstance(value, (float, int)) for value in self.values):
+            raise ContractValidationError("embedding.values", "must be a non-empty vector of numbers")
+        _required_text(self.embedded_content_hash, "embedding.embedded_content_hash")
 
 
 @dataclass(frozen=True)
 class IngestionJob:
     job_id: str
     chunk_id: str
+    context_id: str
     state: IngestionJobState
+    attempt_count: int = 0
+    last_verified_state: IngestionJobState | None = None
+    last_error: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.job_id, "job.job_id")
         _required_text(self.chunk_id, "job.chunk_id")
+        _required_text(self.context_id, "job.context_id")
         if not isinstance(self.state, IngestionJobState):
             raise ContractValidationError("job.state", "must be a supported IngestionJobState")
+        if not isinstance(self.attempt_count, int) or self.attempt_count < 0:
+            raise ContractValidationError("job.attempt_count", "must be a non-negative integer")
+        if self.last_verified_state is not None and not isinstance(self.last_verified_state, IngestionJobState):
+            raise ContractValidationError("job.last_verified_state", "must be a supported IngestionJobState")

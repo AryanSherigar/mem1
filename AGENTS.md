@@ -18,13 +18,26 @@ LongMemEval is the first acceptance benchmark and a source adapter. It must flow
 through the same generic ingestion contracts and orchestration as other context
 sources; it must not define core domain models or storage APIs.
 
-Milestones 0–6 are implemented; M6 has passed local-HydraDB HTTP smoke verification. M4 is a deterministic extraction
-baseline only; M5 is a provider-neutral LLM-assisted decision layer with no
-real model call or graph write. Graph writes, embeddings, and retrieval remain
-gated future work.
+Milestones 0–8 are implemented; M6's local HTTP adapter has only been
+deterministic/manifest-tested in this environment, never live (no `graph-node`
+binary built/running here yet — see verification note in M6). M4 is a
+deterministic extraction baseline only. M5 and M7 have real provider-neutral
+adapters (`LLMClient`-backed entity/temporal models on Fireworks
+`deepseek-v4-flash`, ADR-029; `sentence-transformers` embedder) behind their
+existing ports — both unit-tested against injected fakes and live-verified
+against the real provider/model (opt-in tests, gated on a runtime-environment
+credential, never run by default). M8's orchestrator (ADR-031) does whole-chunk
+idempotent replay, not per-stage resumption, and does **not** yet emit
+`SUPERSEDES` graph edges — that needs a `predicate_key` on extracted
+candidates that the deterministic baseline doesn't produce (ADR-030); a real,
+open, documented gap, not an oversight. Retrieval remains gated future work.
+See [docs/architecture_plan.md](docs/architecture_plan.md) for the current
+single-entry-point description of both parts.
 
 ## Repository Map
 
+- `docs/architecture_plan.md`: single entry point for the accepted ingestion
+  and retrieval design; start here.
 - `hydradb/`: upstream Rust graph database and its authoritative implementation
   documentation.
 - `hydradb/architecture.md`: implemented storage, consistency, indexing,
@@ -48,9 +61,14 @@ gated future work.
 - `src/context_memory/core/`: dependency-free contracts, validation, graph-plan
   types, errors, and temporal/entity decision primitives.
 - `src/context_memory/ingestion/`: active generic ingest and graph-write
-  orchestration; `sources/` owns source-specific mapping.
+  orchestration; `sources/` owns source-specific mapping; `model_adapters.py`
+  and `embedding.py` hold the real (non-fake) LLM/embedding port
+  implementations from ADR-027; `semantic_blocking.py` holds the
+  non-authoritative entity-name cache; `graph_plan_builder.py` maps accepted
+  candidates to a `GraphWritePlan` (ADR-030, no `SUPERSEDES` yet);
+  `orchestrator.py` is the M8 job-state-machine runner (ADR-031).
 - `src/context_memory/client/`: local HydraDB public HTTP client boundary.
-- `tests/`: deterministic contract and domain validation tests.
+- `src/tests/`: deterministic contract and domain validation tests.
 - `db/migrations/`: forward-only checksum-verified PostgreSQL schema changes.
 - `compose.yaml`: local PostgreSQL 16 + pgvector service. Docker daemon required.
 
@@ -260,16 +278,20 @@ fixtures before full benchmark runs.
 Run current application tests with:
 
 ```bash
-PYTHONPATH=src python3.12 -m unittest discover -s tests -v
+PYTHONPATH=src python3.12 -m unittest discover -s src/tests -v
 ```
 
 PostgreSQL integration needs Docker Desktop running, then:
 
 ```bash
 docker compose up -d postgres
-CONTEXT_MEMORY_TEST_DATABASE_URL=postgresql://context_memory@127.0.0.1:54329/context_memory PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
+CONTEXT_MEMORY_TEST_DATABASE_URL=postgresql://context_memory@127.0.0.1:54329/context_memory PYTHONPATH=src .venv/bin/python -m unittest discover -s src/tests -v
 ```
 
 HydraDB live verification is locally token-gated. Supply `CONTEXT_MEMORY_HYDRADB_URL`,
 `CONTEXT_MEMORY_HYDRADB_TOKEN`, and optional `CONTEXT_MEMORY_HYDRADB_DATABASE`
-only through runtime environment, then run `PYTHONPATH=src .venv/bin/python -m unittest tests.test_hydradb_live -v`.
+only through runtime environment, then run:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m unittest tests.test_hydradb_live -v
+```

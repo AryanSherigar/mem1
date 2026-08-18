@@ -264,6 +264,8 @@ Exit criterion: deterministic suite passes; one isolated graph plan round-trips 
 
 ### Milestone 7 — Embedding Persistence
 
+**Approval:** Approved 2026-08-19 (ADR-027). Implemented; local verification only (no provider credential required for this milestone's embedder).
+
 **Goal:** Persist reproducible, versioned semantic seeds.
 
 Proposed work:
@@ -287,6 +289,8 @@ Tests:
 Exit criterion: user reviews retrieval seeds and benchmark evidence.
 
 ### Milestone 8 — Cross-Store Orchestration and Recovery
+
+**Approval:** Approved 2026-08-19 (ADR-030, ADR-031). Implemented as whole-chunk idempotent replay (not per-stage resumption — see ADR-031's hold-ons); `SUPERSEDES` graph edges deferred pending a `predicate_key` on extracted candidates (ADR-030, a real open gap, not an oversight).
 
 **Goal:** Make the full pipeline restart-safe without claiming distributed atomicity.
 
@@ -355,10 +359,12 @@ Deferral means not designed or implemented without a new decision and approval p
 | 2. PostgreSQL persistence | Completed — live PostgreSQL/pgvector integration verified | Approved 2026-08-16 |
 | 3. Generic boundary/LongMemEval adapter/chunking | Completed — generic + live PostgreSQL tests and full-data dry run verified | Approved 2026-08-16 |
 | 4. Extraction/classification | Completed — deterministic baseline, audit persistence, and live PostgreSQL test verified | Approved 2026-08-16 |
-| 5. Entity/temporal resolution | Completed — bounded LLM decision ports, deterministic gates, and fixtures verified; no graph writes | Approved 2026-08-16 |
+| 5. Entity/temporal resolution | Completed — bounded LLM decision ports, deterministic gates, and fixtures verified; real-provider hold-on closed (ADR-029, Fireworks deepseek-v4-flash, live-verified); no graph writes yet | Approved 2026-08-16 |
 | 6. HydraDB adapter | Implemented — local HTTP adapter, immutable graph manifest, deterministic tests, Docker write/read smoke | Approved 2026-08-17 |
-| 7. Embeddings | Blocked by SQL and fact contracts | Not approved |
-| 8. Recovery orchestration | Blocked by both storage adapters | Not approved |
-| 9. End-to-end verification | Blocked by Milestones 0–8 | Not approved |
+| 7. Embeddings | Implemented — `sentence-transformers` embedder + `PostgresEmbeddingStore` against the existing `memory_embeddings` pgvector table; deterministic unit suite verified | Approved 2026-08-19 |
+| 8. Recovery orchestration | Implemented — job state machine, whole-chunk idempotent replay, deterministic + real-Postgres suite verified; `SUPERSEDES` graph edges deferred (needs `predicate_key`, ADR-030) | Approved 2026-08-19 |
+| 9. End-to-end verification | Blocked: needs a real local `graph-node` instance running (none built/running in this environment) plus predicate extraction for full temporal-update coverage | Not approved |
+
+M5's real-provider hold-on (see Milestone 5 above) is now closed by ADR-027/ADR-029: `LLMEntityResolutionModel`/`LLMTemporalUpdateModel` run against Fireworks `deepseek-v4-flash`, unit-tested with an injected fake client and live-verified against the real provider (`src/tests/test_model_adapters_live.py`, opt-in, gated on a runtime-environment credential).
 
 Update this table after every approval, implementation, verification, rejection, or scope change.

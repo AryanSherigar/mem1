@@ -3,9 +3,10 @@
 from collections.abc import Mapping, Sequence
 from hashlib import sha256
 
-from context_memory.core.errors import GraphPayloadConflictError, ImmutableRecordConflictError
+from context_memory.core.enums import IngestionJobState, is_legal_job_transition
+from context_memory.core.errors import GraphPayloadConflictError, IllegalJobTransitionError, ImmutableRecordConflictError
 from context_memory.core.graph import GraphNode, GraphWritePlan
-from context_memory.core.models import Chunk, ContextRecord, ExtractionDraft
+from context_memory.core.models import Chunk, ContextRecord, Embedding, ExtractionDraft, IngestionJob
 from context_memory.core.resolution import EntityProfile, FactState, TemporalRelation
 
 
@@ -45,6 +46,62 @@ class InMemoryChunkStore:
     def get(self, context_id: str, chunk_id: str) -> Chunk | None:
         chunk = self._chunks.get(chunk_id)
         return chunk if chunk is not None and chunk.context_id == context_id else None
+
+
+class InMemoryJobStore:
+    """Deterministic stand-in for `PostgresJobStore`, same transition rules."""
+
+    def __init__(self) -> None:
+        self._jobs: dict[str, IngestionJob] = {}
+
+    def seed(self, chunk_id: str, context_id: str, state: IngestionJobState = IngestionJobState.PENDING_GRAPH) -> IngestionJob:
+        """Create the initial job row (mirrors PostgresChunkStore.put's same-transaction insert)."""
+        job = IngestionJob(job_id=f"job:{chunk_id}", chunk_id=chunk_id, context_id=context_id, state=state)
+        self._jobs[chunk_id] = job
+        return job
+
+    def get(self, chunk_id: str) -> IngestionJob | None:
+        return self._jobs.get(chunk_id)
+
+    def transition(self, chunk_id: str, new_state: IngestionJobState, *, error: str | None = None) -> IngestionJob:
+        job = self._jobs.get(chunk_id)
+        if job is None:
+            raise IllegalJobTransitionError(f"no ingestion job for chunk_id {chunk_id}")
+        if not is_legal_job_transition(job.state, new_state, job.last_verified_state):
+            raise IllegalJobTransitionError(f"chunk {chunk_id}: {job.state.value} -> {new_state.value} is not a legal transition")
+        next_attempt_count = job.attempt_count + 1 if new_state == IngestionJobState.RETRYABLE_FAILED else job.attempt_count
+        terminal_ish = (IngestionJobState.RETRYABLE_FAILED, IngestionJobState.TERMINAL_FAILED, IngestionJobState.MANUAL_REPAIR)
+        next_last_verified = job.state if job.state not in terminal_ish else job.last_verified_state
+        updated = IngestionJob(
+            job_id=job.job_id, chunk_id=chunk_id, context_id=job.context_id, state=new_state,
+            attempt_count=next_attempt_count, last_verified_state=next_last_verified, last_error=error,
+        )
+        self._jobs[chunk_id] = updated
+        return updated
+
+
+class InMemoryEmbeddingStore:
+    def __init__(self) -> None:
+        self._rows: dict[tuple[str, str, str, str, str], Embedding] = {}
+
+    def put(self, embedding: Embedding) -> Embedding:
+        key = (embedding.context_id, embedding.subject_kind, embedding.subject_id, embedding.model_name, embedding.model_version)
+        existing = self._rows.get(key)
+        if existing is not None and existing.embedded_content_hash != embedding.embedded_content_hash:
+            raise ImmutableRecordConflictError(f"embedding {key} has a different embedded_content_hash")
+        self._rows[key] = embedding
+        return embedding
+
+    def deactivate(self, context_id: str, subject_kind: str, subject_id: str) -> None:
+        for key, embedding in list(self._rows.items()):
+            if key[0] == context_id and key[1] == subject_kind and key[2] == subject_id:
+                self._rows[key] = Embedding(
+                    context_id=embedding.context_id, subject_kind=embedding.subject_kind,
+                    subject_id=embedding.subject_id, source_chunk_id=embedding.source_chunk_id,
+                    model_name=embedding.model_name, model_version=embedding.model_version,
+                    values=embedding.values, embedded_content_hash=embedding.embedded_content_hash,
+                    is_active=False,
+                )
 
 
 class InMemoryGraphIdAllocator:

@@ -3,8 +3,8 @@
 | Field | Value |
 |---|---|
 | Status | Living, append-only decision history |
-| Last verified | 2026-08-17 against local HTTP Docker write/read smoke and PostgreSQL manifest implementation |
-| Next review | Milestone 7 approval packet |
+| Last verified | 2026-08-19 against local HTTP Docker write/read smoke, PostgreSQL manifest implementation, deterministic M7 embedding/model-adapter unit suite, and a hosted HydraDB v2 sandbox investigation (ADR-026) |
+| Next review | Milestone 8 approval packet |
 | Roadmap | [ingestion_pipeline_roadmap.md](ingestion_pipeline_roadmap.md) |
 
 ## 1. Governance
@@ -46,6 +46,16 @@ Every material entry records why, tradeoffs, consequences, revisit triggers, and
 | ADR-019 | Deterministic extraction baseline and quality gate | Accepted | 2026-08-16 |
 | ADR-020 | Bounded LLM assistance for entity and temporal ambiguity | Accepted | 2026-08-16 |
 | ADR-021 | Bolt graph writer and immutable graph manifest | Accepted | 2026-08-16 |
+| ADR-022 | Hosted HydraDB memory ingestion supersedes OSS Bolt writes | Superseded by ADR-023 | 2026-08-17 |
+| ADR-023 | Checked-in HydraDB local Bolt runtime supersedes hosted API | Superseded by ADR-024 (transport only) | 2026-08-17 |
+| ADR-024 | Local HTTP transport supersedes Bolt driver | Accepted | 2026-08-17 |
+| ADR-025 | Ingestion-only package routing mirrors relevant HydraDB layers | Accepted | 2026-08-17 |
+| ADR-026 | Hosted HydraDB v2 knowledge/memory API evaluated and held; local graph-node stays sole source of truth | Deferred | 2026-08-19 |
+| ADR-027 | Provider-neutral LLM client and local embedding model adopted for M5/M7 | Accepted | 2026-08-19 |
+| ADR-028 | Obsolete pulled-runtime documents removed | Accepted | 2026-08-19 |
+| ADR-029 | Fireworks + deepseek-v4-flash as the M5 model provider | Accepted | 2026-08-19 |
+| ADR-030 | Candidate-to-graph-plan mapping; SUPERSEDES deferred pending predicate_key | Accepted | 2026-08-19 |
+| ADR-031 | M8 job state machine: whole-chunk idempotent replay, not per-stage resumption | Accepted | 2026-08-19 |
 
 ## 3. Accepted Decisions
 
@@ -528,3 +538,119 @@ downstream callers migrate.
 
 **Verification:** Import-route test plus full ingestion/unit suite. No
 retrieval/chat module changes under this ADR.
+
+### ADR-026 — Hosted HydraDB v2 Knowledge/Memory API Evaluated and Held
+
+**Status:** Deferred
+**Date:** 2026-08-19
+
+**Decision:** A credentialed round trip against the hosted HydraDB v2 API (`api.hydradb.com`, `POST /context/ingest`, `GET /context/status`, `POST /query`) was run in a sandbox database. The local `graph-node` (ADR-023/ADR-024) remains the sole source of truth for graph topology and bitemporal fact state. The hosted v2 API is not adopted as part of the active runtime; it is parked as a documented option for a later, explicitly-scoped local-vs-hosted comparison.
+
+**Why:** Probing showed hosted v2 is a managed knowledge/memory RAG product (its own chunking, embeddings, BM25, LLM entity/relation extraction, temporal reasoning), not a Cypher-like graph surface. Two findings rule it out as a source-of-truth candidate today: (1) its `temporal_facts` structured output (`event_start`/`event_end`/`date_precision`/`status`) is only populated for sources that go through its own LLM extraction — Bring-Your-Own-Graph (`graph_payload`) submissions, which are what bounded/deterministic ingestion (ADR-019/ADR-020) would have to use, get zero `temporal_facts` entries; (2) even where populated, `temporal_facts` carries one time axis (world/event validity) with no equivalent of `observed_at`/`superseded_at` (ADR-006), so it cannot host bitemporal state regardless. A BYOG relation also has no structured property bag to carry those fields ourselves (`source`/`target`/`predicate`/`context`/`temporal_details` only, `temporal_details` is a single freeform string).
+
+**Alternatives considered:** Hybrid split (local graph-node as bitemporal system of record, hosted v2 as a one-way, rebuildable search projection fed by an outbox) — judged architecturally sound (comparable to a Postgres-behind-search-index pattern) but not adopted now because its own justification (hosted search quality beating pgvector/Postgres full-text search) is unverified, it adds a second operated dependency alongside the already-self-hosted `graph-node` cluster, and it would route conversational content to a third party before any PII/retention policy exists for this project.
+
+**Tradeoffs / hold-ons:** No hosted-v2 code, config, or credentials are part of the active runtime. The `hackhydra-smoke` sandbox database and its one test record remain live in the vendor account from this investigation; not referenced by any code path. Revisiting this requires a real pgvector/FTS-vs-hosted-v2 retrieval-quality comparison and a data-handling decision, not just renewed interest.
+
+**Consequences:** ADR-001's storage split (PostgreSQL: raw evidence/embeddings/job state; HydraDB: graph/temporal topology/traversal) stands unchanged and unambiguously: "HydraDB" throughout this decision log and the architecture plan means the local `graph-node`, never the hosted v2 API, unless a future ADR says otherwise.
+
+**Verification:** Manual credentialed round trip (database create → knowledge ingest with `graph_payload` → status poll → query with `graph_context`/`temporal_facts`) and a second probe isolating LLM-extraction-path vs BYOG-path `temporal_facts` population, both run against a live sandbox database, 2026-08-19.
+
+**Revisit trigger:** A scoped, approved comparison shows hosted v2 retrieval quality meaningfully exceeds pgvector/Postgres full-text search, and a data-handling/PII policy for external egress of conversational content is approved.
+
+### ADR-027 — Provider-Neutral LLM Client and Local Embedding Model Adopted for M5/M7
+
+**Status:** Accepted
+**Date:** 2026-08-19
+
+**Decision:** Adopt the OpenAI-compatible `LLMClient` (structured/text completion behind `base_url`/`api_key`/`model_name`, provider-agnostic across Fireworks/OpenRouter/Groq/OpenAI) as the concrete implementation behind the existing `EntityResolutionModel` and `TemporalUpdateModel` ports (`ingestion/ports.py`), unblocking M5's held real-provider connection. Adopt `sentence-transformers/all-MiniLM-L6-v2` (384-dim, CPU, no API key required — already the model named in `retrieval_architecture.md` §3) as the concrete `Embedder` port implementation, unblocking M7. The in-process `EntityNameIndex`/embedding-cache pattern is adopted only as a non-authoritative Tier-2 semantic-blocking cache for entity resolution, rebuilt from PostgreSQL/pgvector on demand; it is never the embedding source of truth (pgvector is, per ADR-013).
+
+**Why:** Both ports already existed as deterministic-fake-only Protocols with the model-selection guardrail enforced by the caller (`EntityRegistry.resolve` rejects any ID outside the bounded candidate set — ports.py/resolution.py behavior is unchanged by this ADR). This closes the M5 hold-on and the M7 blocker without redesigning either boundary. `sentence-transformers` needs no provider credential, so embedding generation and pgvector persistence can be verified locally today, unlike the LLM-backed ports.
+
+**Alternatives:** Call an API-based embedding endpoint through the same `LLMClient` instead of a local model — rejected for now because it would make M7 verification credential-gated too, for no accuracy benefit at this scale, and `retrieval_architecture.md` already approved the local model. Porting the UUID/sha256 `IdGenerator` from the evaluated main-branch work — rejected; the existing `logical_key` + PostgreSQL integer-registry design (`allocate_graph_id`, ADR-014) already implements the same determinism principle and is what HydraDB's local mutation surface requires, so the UUID generator would be redundant, not additive.
+
+**Tradeoffs / hold-ons:** No LLM provider credential is present in this environment (`.env` carries only `HYDRA_DB_API_KEY`), so `LLMEntityResolutionModel`/`LLMTemporalUpdateModel` are implemented and unit-tested against an injected fake client only; live verification against a real provider remains held until credentials are supplied, exactly as M6 held for its HydraDB token. The semantic-blocking cache is process-local and cold-starts empty; it is a candidate-recall aid, never a correctness dependency, since exact/alias matching and the bounded-LLM tier remain the resolution authority.
+
+**Consequences:** New dependencies (`openai`, `pydantic`, `python-dotenv`, `sentence-transformers`, `numpy`) added to `pyproject.toml`. New modules: `context_memory/core/llm_client.py`, `context_memory/core/config.py`, `context_memory/ingestion/model_adapters.py`, `context_memory/ingestion/embedding.py`, `context_memory/ingestion/semantic_blocking.py`, `context_memory/persistence/postgres.py::PostgresEmbeddingStore`. Roadmap M7 moves from "blocked" to "implemented, embedding generation locally verified"; M5's real-provider hold-on moves to "adapters implemented, live verification pending provider credentials."
+
+**Verification:** Deterministic unit tests for both LLM-backed adapters using an injected fake OpenAI-shaped client (no network call); deterministic unit tests for the embedder using an injected fake encoder; an opt-in local smoke test (gated behind an explicit environment flag, mirroring `test_hydradb_live.py`) that loads the real `sentence-transformers` model and embeds text, since no credential is required for that path. PostgreSQL round-trip tests for `PostgresEmbeddingStore` follow the existing `CONTEXT_MEMORY_TEST_DATABASE_URL`-gated pattern.
+
+**Revisit trigger:** A real LLM provider credential is supplied (triggers live M5 verification); measured embedding latency/accuracy motivates a different model; M8 recovery work changes how `pending_embeddings` jobs are retried.
+
+### ADR-028 — Obsolete Pulled-Runtime Documents Removed
+
+**Status:** Accepted
+**Date:** 2026-08-19
+
+**Decision:** Remove `ARCHITECTURE.md`, `AGENT.md`, `docs/semantic_memory_distillation.md`, `docs/startup_hydration_id_generation.md`, `docs/llm_model_config.md`, `docs/entity_resolution_strategy.md`, and `docs/temporal_query_resolver.md` from the repository. `docs/architecture_plan.md` is the new single entry point describing the accepted ingestion and retrieval design.
+
+**Why:** All seven describe the "Assistant-memory runtime" design identified in `architecture_flow_comparison.md` §1 (in-process NumPy vector authority, UUID graph IDs, hosted-API-first framing, unbounded LLM ADD/UPDATE/DELETE, full-wipe re-ingestion) that Milestones 0–7 do not follow and that conflicts with Accepted ADRs (ADR-001 storage split, ADR-006 bitemporal model, ADR-014 integer graph IDs, ADR-019/ADR-020 bounded extraction/resolution). None of the seven are listed in `AGENTS.md`'s repository map; `graph_schema_proposal.md` and `retrieval_architecture.md`, which share their hackathon-era origin, already carry an explicit "current runtime decision" correction banner and stay. Keeping contradicting documents in the tree next to the accepted design was the actual source of confusion this decision resolves.
+
+**Alternatives:** Keep the documents with a superseded banner (rejected — this repository already tried that for two documents and the other five never got one, and seven banners duplicate what a single removal note plus git history already provides); fold their salvageable content into `architecture_plan.md` first (checked — nothing in the seven is not already covered by an Accepted ADR or a surviving living document).
+
+**Tradeoffs / hold-ons:** Full text remains recoverable from git history at the commit before this ADR; nothing here is destroyed, only removed from the working tree. `architecture_flow_comparison.md` itself is kept as the historical review artifact that produced this decision, not deleted.
+
+**Consequences:** `AGENTS.md`'s repository map and `docs/ingestion_pipeline_roadmap.md` are updated in the same change set to stop referencing removed files and to add `docs/architecture_plan.md`.
+
+**Verification:** `git log --follow` on any removed path recovers full history; `docs/architecture_plan.md` published in the same commit.
+
+**Revisit trigger:** None expected; reopen only if a removed document's content is needed for a future audit, retrievable from git history without restoring it to the working tree.
+
+### ADR-029 — Fireworks + deepseek-v4-flash as the M5 Model Provider
+
+**Status:** Accepted
+**Date:** 2026-08-19
+
+**Decision:** Use Fireworks (`https://api.fireworks.ai/inference/v1`) with `accounts/fireworks/models/deepseek-v4-flash-0731` as the default model behind both `LLMEntityResolutionModel` and `LLMTemporalUpdateModel` (ADR-027). Credential resolution: `ENTITY_RESOLUTION_API_KEY`/`TEMPORAL_UPDATE_API_KEY` if set, else the shared `FIREWORKS_API_KEY`, so one key in `.env` is sufficient. This closes the M5 hold-on ("connecting a real model provider requires its own operational approval") that ADR-020 left open.
+
+**Why:** User-supplied credential and explicit model choice. `LLMClient` was already provider-neutral (ADR-027); this is a configuration/default change, not a new code path.
+
+**Tradeoffs / hold-ons:** No PII handling, cost, rate-limit, or retry policy has been decided for this provider — `architecture_flow_comparison.md`'s "Model/provider policy" row is still open beyond the bare provider/model choice made here. `structured_completion`'s `response_format: json_object` + `temperature: 0.0` request shape was verified against this exact model/endpoint (see Verification); no `max_tokens`/`top_k`/penalty tuning has been applied.
+
+**Consequences:** `core/config.py` defaults changed from placeholder `gpt-oss-20b` to `accounts/fireworks/models/deepseek-v4-flash-0731` for both roles. `.env` (now at `src/.env` after the repository restructure) carries `FIREWORKS_API_KEY`; no key is logged or committed.
+
+**Verification:** Live call against the real endpoint: (1) a bare `structured_completion` round trip, (2) `LLMEntityResolutionModel.resolve_entity` against a bounded 2-candidate set and against a no-match set, (3) `LLMTemporalUpdateModel.classify_update` on a correction-shaped and a state-change-shaped fact pair. Run 2026-08-19; see the session record for exact outputs. A checked-in opt-in live test (`src/tests/test_model_adapters_live.py`, gated on `FIREWORKS_API_KEY`/role-specific keys being present in the runtime environment, mirroring `test_hydradb_live.py`) now repeats this. Building that test surfaced and fixed a real bug: `core/config.py` initially auto-called `load_dotenv()` at import time (copied from `main` branch's script-style config); since `unittest discover` imports every test module to enumerate cases, that silently repopulated `FIREWORKS_API_KEY` from `src/.env` even when the shell didn't have it set, defeating the live test's `skipUnless` gate and risking a real billed call from a plain, non-targeted test run. Fixed by removing the auto-load — this module now only reads `os.environ`, exactly like `test_hydradb_live.py` already does for the HydraDB token; credentials must come from an explicitly-sourced `.env` or an exported var. Verified both directions: unset → all live-gated tests skip in 0.17s with zero network activity; explicitly sourced → all four live tests pass for real.
+
+**Revisit trigger:** Response latency/cost motivates a different model; a PII/retry/rate-limit policy is approved and requires client changes beyond model selection.
+
+### ADR-030 — Candidate-to-Graph-Plan Mapping; SUPERSEDES Deferred Pending `predicate_key`
+
+**Status:** Accepted
+**Date:** 2026-08-19
+
+**Decision:** `ingestion/graph_plan_builder.py::GraphPlanBuilder` maps one `Chunk` + its accepted `ExtractedMemoryCandidate`s into a `GraphWritePlan`: one `Session` node (keyed by `record.session_id`, falling back to a per-`context_id` default bucket when absent), one `Turn` node per chunk, one `Fact` node per accepted candidate, one `Entity` node per resolved mention, `Alias` nodes for every alias already on the resolved `EntityProfile`, and `HAS_TURN`/`EXTRACTED_FROM`/`ABOUT`/`HAS_ALIAS` edges connecting them — labels/types unchanged from `core/graph.py` (already approved). An entity mention that resolves to `None` (`EntityResolution.entity is None`) gets no `ABOUT` edge — never a forced link, preserving ADR-020's guarantee at this layer too.
+
+Explicitly out of scope for this builder: `SUPERSEDES` edges and `RELATES_TO` edges. Nothing is invented to fill the gap; see rationale.
+
+**Why:** `TemporalUpdateClassifier.classify` (ADR-020) requires a `FactState.predicate_key` to run its same-subject/same-predicate gate before it will even consider calling the model. Nothing in the deterministic extraction baseline (ADR-019) produces a predicate for a candidate — `ExtractedMemoryCandidate`/`ExtractionDraft` carry free text only, no subject/predicate/object decomposition. Wiring `SUPERSEDES` here would mean inventing a predicate-extraction heuristic inside graph-plan construction, which is extraction-quality work, not plan-mapping work, and would misrepresent the deterministic baseline's own documented limits (ADR-019: "no code may describe M4 as production extraction quality"). `RELATES_TO` has no source data driving it at all yet (no entity-entity relation extraction exists anywhere in the pipeline).
+
+**Alternatives:** Derive a weak predicate heuristic (e.g., first verb phrase, or reuse `memory_type`) just to unblock `SUPERSEDES` — rejected, this would silently encode an extraction-quality decision as if it were settled, the opposite of this project's own governance rule against inferring unresolved decisions. Skip building the graph-plan mapping until predicate extraction exists — rejected, the Session/Turn/Fact/Entity/Alias/`ABOUT` structure is fully specified today and has real value (queryable provenance graph) independent of supersession.
+
+**Tradeoffs / hold-ons:** Corrections and real-world updates are not yet representable in the graph — every accepted candidate becomes a new `Fact` node with no link back to anything it might supersede, even when the deterministic/bounded machinery to *decide* that (ADR-020) already exists and is live-verified (ADR-029). This is a real, load-bearing gap, not a minor one: bitemporal correctness (ADR-006) has no graph-side representation until it's closed.
+
+**Consequences:** A future extraction milestone must add `predicate_key` (or equivalent subject/predicate structure) to `ExtractedMemoryCandidate` before `GraphPlanBuilder` can be extended with `SUPERSEDES`. Until then, `TemporalUpdateClassifier` remains built, tested (deterministic + live, ADR-029), and unreachable from the real ingestion path — a documented, not hidden, gap.
+
+**Verification:** Deterministic unit tests (`src/tests/test_graph_plan_builder.py`) cover: zero-candidate chunks still produce Session/Turn; unresolved mentions produce no `Entity`/`ABOUT`; resolved mentions produce both; aliases produce `Alias`/`HAS_ALIAS` pairs; every node/relationship carries `context_id` (required by `GraphWritePlan.__post_init__`); repeated builds are deterministically replayable (identical graph IDs).
+
+**Revisit trigger:** A future extraction milestone adds predicate/subject-object structure to extracted candidates, at which point `SUPERSEDES` wiring becomes possible and should be added as its own ADR, not folded silently into this one.
+
+### ADR-031 — M8 Job State Machine: Whole-Chunk Idempotent Replay, Not Per-Stage Resumption
+
+**Status:** Accepted
+**Date:** 2026-08-19
+
+**Decision:** `ingestion/orchestrator.py::IngestionOrchestrator` drives each chunk through extraction → graph-plan construction → graph write → embedding persistence → verification → `completed`, transitioning `ingestion_jobs.state` at each boundary per the table in `docs/ingestion_contract_v1.md` §5 (now implemented as `core/enums.py::is_legal_job_transition`, table-driven and independently unit-tested). On any exception, the job moves to `retryable_failed` (transient/unclassified errors) or `terminal_failed` (`ContractValidationError`/`ImmutableRecordConflictError`/`GraphPayloadConflictError` — payload/policy problems retrying can't fix), capturing the last successfully-reached state. Retrying means calling the same entrypoint again: it **re-runs the whole chunk from the top** — extraction, resolution, graph-plan construction, the graph write, and embedding persistence all over again — relying on each stage's already-existing idempotent-replay behavior (`ExtractionService`'s stable `attempt_id`, `PostgresGraphManifestStore`, `PostgresEmbeddingStore`, `GraphWriter`'s `MERGE` identities) rather than resuming from a finer-grained checkpoint.
+
+The state-transition table was generalized from the contract's single documented "next state" per row to "any state at or after the current one in happy-path order is a legal target," specifically so a full top-to-bottom replay can re-issue a state the job already reached (e.g. resuming `retryable_failed` straight to `pending_embeddings` when `last_verified_state` was already `pending_graph`) without that looking like an illegal regression.
+
+**Why:** True per-stage resumption (skip straight to "just redo the embeddings step") needs a way to reload what extraction/resolution already decided without recomputing it — `ExtractionStore`/`EmbeddingStore` are currently write/audit-only ports with no read-back method, and building that read path is its own scoped piece of work, not a byproduct of wiring the state machine. Whole-chunk replay is strictly weaker but correct today, given every stage it touches was already built to tolerate exactly this.
+
+**Alternatives:** Build the read-back ports now and do true per-stage resumption — rejected for this pass on scope grounds; flagged as future work below. Treat any failure as `terminal_failed` (no automatic retry at all) — rejected, it would make every transient network blip (the exact `_FailNTimesTransport` scenario the tests exercise) require manual intervention, defeating the point of M8.
+
+**Tradeoffs / hold-ons:** Cost, not correctness: a chunk that fails at the embeddings stage after a successful (idempotent) graph write still re-extracts and re-submits an unchanged graph plan on retry — wasted LLM/embedding-model calls and network round trips, never wasted correctness, since every re-submitted stage is a verified no-op on unchanged input. Verification before `completed` is same-process evidence (nothing raised, plus one real `chunk_store.get` re-read) — not an independent re-read of HydraDB or pgvector, since `EmbeddingStore` has no `get`/`exists` port yet; a crash between `verifying` and `completed` is caught by the next replay re-doing the same idempotent work, not by a genuinely independent audit.
+
+**Consequences:** New: `core/enums.py::is_legal_job_transition`, `core/errors.py::IllegalJobTransitionError`, `persistence/postgres.py::PostgresJobStore` (+ `fakes.py::InMemoryJobStore`), `ingestion/orchestrator.py::IngestionOrchestrator`. `core/models.py::IngestionJob` extended with `context_id`/`attempt_count`/`last_verified_state`/`last_error` to carry what the state machine needs (previously `job_id`/`chunk_id`/`state` only). `ports.py` gained `JobStore` and `EmbeddingStore` Protocols.
+
+**Verification:** `src/tests/test_job_transitions.py` (11 tests, pure state-table logic, every table row plus the generalized skip-ahead/idempotent-replay rule). `src/tests/test_orchestrator.py` (6 tests, fakes only): happy path reaches `completed` and writes the expected graph/embedding shape; zero-candidate chunk still completes; a transient failure produces `retryable_failed` and a second call succeeds; a `completed` job is never reprocessed; a `terminal_failed` job blocks auto-retry. `PostgresJobStore` verified against real PostgreSQL: lifecycle to `completed`, `seed` idempotency (does not reset progress), illegal-transition rejection, `attempt_count` increment on failure.
+
+**Revisit trigger:** Retry cost (re-running extraction/graph-write/embeddings on every retry) is measured and found too expensive, motivating `ExtractionStore`/`EmbeddingStore` read-back ports and true per-stage resumption as a follow-up ADR.

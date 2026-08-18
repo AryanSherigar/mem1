@@ -3,7 +3,8 @@
 from collections.abc import Sequence
 from typing import Protocol
 
-from context_memory.core.models import Chunk, ContextRecord, ExtractionDraft
+from context_memory.core.enums import IngestionJobState
+from context_memory.core.models import Chunk, ContextRecord, Embedding, ExtractionDraft, IngestionJob
 from context_memory.core.resolution import EntityProfile, FactState, TemporalRelation
 from context_memory.core.graph import GraphWritePlan
 
@@ -26,6 +27,30 @@ class ChunkStore(Protocol):
     def put(self, chunk: Chunk) -> Chunk: ...
 
     def get(self, context_id: str, chunk_id: str) -> Chunk | None: ...
+
+
+class JobStore(Protocol):
+    """Milestone 8 recovery state machine (docs/ingestion_contract_v1.md §5)."""
+
+    def get(self, chunk_id: str) -> IngestionJob | None: ...
+
+    def seed(self, chunk_id: str, context_id: str) -> IngestionJob:
+        """Idempotent: `PostgresChunkStore.put` already inserts this row in the same
+        transaction as the chunk (ADR-014); this is a defensive fallback for callers
+        (or fakes) whose chunk store doesn't create the job row itself."""
+        ...
+
+    def transition(
+        self, chunk_id: str, new_state: IngestionJobState, *, error: str | None = None
+    ) -> IngestionJob: ...
+
+
+class EmbeddingStore(Protocol):
+    """PostgreSQL/pgvector-backed versioned embedding persistence (Milestone 7)."""
+
+    def put(self, embedding: Embedding) -> Embedding: ...
+
+    def deactivate(self, context_id: str, subject_kind: str, subject_id: str) -> None: ...
 
 
 class ExtractionStore(Protocol):

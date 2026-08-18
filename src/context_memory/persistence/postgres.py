@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 
-from context_memory.core.errors import GraphPayloadConflictError, ImmutableRecordConflictError
+from context_memory.core.enums import IngestionJobState, is_legal_job_transition
+from context_memory.core.errors import GraphPayloadConflictError, IllegalJobTransitionError, ImmutableRecordConflictError
 from context_memory.core.graph import GraphNode, GraphRelationship, GraphWritePlan
-from context_memory.core.models import Chunk, ExtractedMemoryCandidate, SourceDescriptor
+from context_memory.core.models import Chunk, Embedding, ExtractedMemoryCandidate, IngestionJob, SourceDescriptor
 
 
 class PostgresChunkStore:
@@ -232,3 +233,150 @@ class PostgresGraphManifestStore:
         if isinstance(record, GraphNode):
             return {"label": record.label, "id": record.graph_id, "properties": dict(record.properties)}
         return {"type": record.relationship_type, "id": record.graph_id, "source": record.source_id, "destination": record.destination_id, "source_label": record.source_label, "destination_label": record.destination_label, "properties": dict(record.properties)}
+
+
+class PostgresEmbeddingStore:
+    """Versioned fact/chunk embedding persistence against `memory_embeddings` (Milestone 7)."""
+
+    def __init__(self, connection: object) -> None:
+        self._connection = connection
+
+    def put(self, embedding: Embedding) -> Embedding:
+        """Insert once per (context, subject, model, version); replay with the same
+        content hash is a no-op, a changed hash under the same version is rejected
+        (re-embedding the same version must not silently rewrite a prior vector)."""
+        with self._connection.transaction():
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT embedded_content_hash FROM memory_embeddings
+                    WHERE context_id = %s AND subject_kind = %s AND subject_id = %s
+                      AND model_name = %s AND model_version = %s
+                    FOR UPDATE
+                    """,
+                    (
+                        embedding.context_id, embedding.subject_kind, embedding.subject_id,
+                        embedding.model_name, embedding.model_version,
+                    ),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if existing[0] != embedding.embedded_content_hash:
+                        raise ImmutableRecordConflictError(
+                            f"embedding for {embedding.subject_kind}:{embedding.subject_id} "
+                            f"model {embedding.model_name}/{embedding.model_version} "
+                            "has a different embedded_content_hash"
+                        )
+                    return embedding
+                vector_literal = "[" + ",".join(repr(float(value)) for value in embedding.values) + "]"
+                cursor.execute(
+                    """
+                    INSERT INTO memory_embeddings (
+                        context_id, subject_kind, subject_id, source_chunk_id,
+                        model_name, model_version, dimensions, embedding,
+                        embedded_content_hash, is_active
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector, %s, %s)
+                    """,
+                    (
+                        embedding.context_id, embedding.subject_kind, embedding.subject_id,
+                        embedding.source_chunk_id, embedding.model_name, embedding.model_version,
+                        len(embedding.values), vector_literal, embedding.embedded_content_hash,
+                        embedding.is_active,
+                    ),
+                )
+        return embedding
+
+    def deactivate(self, context_id: str, subject_kind: str, subject_id: str) -> None:
+        """Mark all model versions of one subject inactive (e.g. superseded fact)."""
+        with self._connection.transaction():
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE memory_embeddings SET is_active = false
+                    WHERE context_id = %s AND subject_kind = %s AND subject_id = %s
+                    """,
+                    (context_id, subject_kind, subject_id),
+                )
+
+
+class PostgresJobStore:
+    """Milestone 8 recovery state machine over `ingestion_jobs` (docs/ingestion_contract_v1.md §5)."""
+
+    def __init__(self, connection: object) -> None:
+        self._connection = connection
+
+    def get(self, chunk_id: str) -> IngestionJob | None:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT job_id, chunk_id, context_id, state, attempt_count, last_verified_state, last_error
+                FROM ingestion_jobs WHERE chunk_id = %s
+                """,
+                (chunk_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return IngestionJob(
+            job_id=row[0], chunk_id=row[1], context_id=row[2], state=IngestionJobState(row[3]),
+            attempt_count=row[4], last_verified_state=IngestionJobState(row[5]) if row[5] else None,
+            last_error=row[6],
+        )
+
+    def seed(self, chunk_id: str, context_id: str) -> IngestionJob:
+        """Idempotent: PostgresChunkStore.put already inserts this row (ADR-014); this
+        is a defensive fallback, safe to call even when that row already exists."""
+        with self._connection.transaction():
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO ingestion_jobs (job_id, chunk_id, context_id, state)
+                    VALUES (%s, %s, %s, 'pending_graph')
+                    ON CONFLICT (chunk_id) DO NOTHING
+                    """,
+                    (f"job:{chunk_id}", chunk_id, context_id),
+                )
+        job = self.get(chunk_id)
+        if job is None:
+            raise RuntimeError(f"job seed for chunk_id {chunk_id} did not produce a row")
+        return job
+
+    def transition(self, chunk_id: str, new_state: IngestionJobState, *, error: str | None = None) -> IngestionJob:
+        with self._connection.transaction():
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT job_id, context_id, state, attempt_count, last_verified_state
+                    FROM ingestion_jobs WHERE chunk_id = %s FOR UPDATE
+                    """,
+                    (chunk_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise IllegalJobTransitionError(f"no ingestion job for chunk_id {chunk_id}")
+                job_id, context_id, current_raw, attempt_count, last_verified_raw = row
+                current = IngestionJobState(current_raw)
+                last_verified = IngestionJobState(last_verified_raw) if last_verified_raw else None
+                if not is_legal_job_transition(current, new_state, last_verified):
+                    raise IllegalJobTransitionError(
+                        f"chunk {chunk_id}: {current.value} -> {new_state.value} is not a legal transition"
+                    )
+                next_attempt_count = attempt_count + 1 if new_state == IngestionJobState.RETRYABLE_FAILED else attempt_count
+                next_last_verified = current.value if current.value not in (
+                    IngestionJobState.RETRYABLE_FAILED.value, IngestionJobState.TERMINAL_FAILED.value,
+                    IngestionJobState.MANUAL_REPAIR.value,
+                ) else last_verified_raw
+                cursor.execute(
+                    """
+                    UPDATE ingestion_jobs
+                    SET state = %s, attempt_count = %s, last_verified_state = %s, last_error = %s, updated_at = now()
+                    WHERE chunk_id = %s
+                    """,
+                    (new_state.value, next_attempt_count, next_last_verified, error, chunk_id),
+                )
+        return IngestionJob(
+            job_id=job_id, chunk_id=chunk_id, context_id=context_id, state=new_state,
+            attempt_count=next_attempt_count,
+            last_verified_state=IngestionJobState(next_last_verified) if next_last_verified else None,
+            last_error=error,
+        )
