@@ -46,16 +46,16 @@ class Config:
         default_factory=lambda: os.getenv("READER_MODEL", "gpt-oss-120b")
     )
 
-    # # Judge Model Config
-    # judge_base_url: str = field(
-    #     default_factory=lambda: os.getenv("JUDGE_BASE_URL", "https://openrouter.ai/api/v1")
-    # )
-    # judge_api_key: str = field(
-    #     default_factory=lambda: os.getenv("JUDGE_API_KEY", os.getenv("OPENROUTER_API_KEY", ""))
-    # )
-    # judge_model: str = field(
-    #     default_factory=lambda: os.getenv("JUDGE_MODEL", "meta-llama/llama-3.3-70b-instruct")
-    # )
+    # Judge Model Config
+    judge_base_url: str = field(
+        default_factory=lambda: os.getenv("JUDGE_BASE_URL", "https://openrouter.ai/api/v1")
+    )
+    judge_api_key: str = field(
+        default_factory=lambda: os.getenv("JUDGE_API_KEY", os.getenv("OPENROUTER_API_KEY", ""))
+    )
+    judge_model: str = field(
+        default_factory=lambda: os.getenv("JUDGE_MODEL", "meta-llama/llama-3.3-70b-instruct")
+    )
 
     # Retrieval & Engine Constants (per AGENT.md)
     temporal_buffer_seconds: float = 172800.0  # ±2 days

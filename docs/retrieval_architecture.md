@@ -1,44 +1,81 @@
-# Hybrid Retrieval Architecture — Semantic Seeding + Graph Traversal
+# Hybrid Retrieval Architecture — PostgreSQL/pgvector Seeding + HydraDB Traversal
 
-Follow-up to [graph_schema_proposal.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/graph_schema_proposal.md) and companion to [semantic_memory_distillation.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/docs/semantic_memory_distillation.md).
+> **Current runtime decision (2026-08-17):** direct OpenCypher traversal against
+> the checked-in local HydraDB server is the active design. The application
+> builds provenance-preserving graph plans; HydraDB stores and traverses them.
+
+Follow-up to [graph_schema_proposal.md](graph_schema_proposal.md).
+
+Canonical ingestion input is defined in [ingestion_contract_v1.md](ingestion_contract_v1.md).
+
+Implementation remains gated by [ingestion_pipeline_roadmap.md](ingestion_pipeline_roadmap.md). Approved rationale and open hold-ons are tracked in [decisions.md](decisions.md).
 
 ---
 
-## 0. Why No Separate Vector Database — Confirmed Understanding
+## 0. Why PostgreSQL Alongside HydraDB
 
-At `longmemeval_s` scale (~1,200 facts, ~40 sessions, ~500 entities), a separate vector DB adds operational complexity (second service, consistency sync on `SUPERSEDES` invalidations) that dwarfs any performance benefit. In-process embedding search over a few hundred vectors is sub-millisecond with numpy. The sync problem is real: every `SUPERSEDES` edge must atomically update `is_current` in HydraDB **and** remove/update the embedding in the vector index. With in-process storage, both happen in the same Python process, in the same ingestion transaction. No distributed consistency problem to solve.
+The original in-process Python dictionary/NumPy design is no longer the MVP storage decision. It loses embeddings on restart, has no durable chunk source of truth, and cannot provide reliable replay or model-version tracking.
+
+The approved MVP boundary is:
+
+- **PostgreSQL** stores immutable raw chunks, chunk metadata and hashes, embeddings, model versions, and ingestion/checkpoint state.
+- **HydraDB** stores facts, entities, provenance references, memory type/scope,
+  temporal/update links, and traversal topology.
+
+PostgreSQL with [pgvector](https://github.com/pgvector/pgvector) keeps evidence and vectors in one durable SQL system. It supports exact and approximate nearest-neighbor search, metadata filters, and normal SQL transactions. PostgreSQL also leaves a path to sparse retrieval through [built-in full-text search](https://www.postgresql.org/docs/current/textsearch-tables.html).
+
+This does **not** make PostgreSQL and HydraDB one atomic transaction. Cross-store ingestion requires idempotency, explicit job states, verification, and replay after partial failure.
+
+Core storage/retrieval uses generic `context_id` and source metadata. LongMemEval enters through a dedicated adapter that emits the same canonical records as any other source; benchmark fields never appear in core SQL or graph contracts. Its timezone-free minute timestamps use one explicit benchmark-local ordering basis; `question_date` must use that same normalization during later evaluation/retrieval adaptation.
 
 ---
 
-## 1. Embedding Property Type Decision
+## 1. Storage Responsibility Decision
 
-**Answer: No. HydraDB cannot store a float-array property.**
+HydraDB cannot store a float-array property:
 
-From [cypher-compat.md](file:///home/aryan-sherigar/projects/hydradb-hackathon/hydradb/cypher-compat.md) line 242:
+From [cypher-compat.md](../hydradb/cypher-compat.md):
 
 > Property values are integers, floats, booleans and strings.
 
 Scalar types only. No lists, no arrays, no binary blobs. An embedding vector (384 floats) cannot be stored as a node property.
 
-**Consequence**: Embeddings live in an **in-process Python structure** — a dictionary mapping `Fact.id → numpy.ndarray`. The `Fact` node in HydraDB carries no embedding property. The join key is `Fact.id` (an integer), which exists in both stores.
+**Consequence**: embeddings live in PostgreSQL/pgvector, not HydraDB and not a process-local dictionary. `Fact.id`, `context_id`, and `source_chunk_id` form the cross-store join contract.
+
+Canonical ownership:
+
+| Data | Store | Notes |
+|---|---|---|
+| Raw chunk text | PostgreSQL | Immutable evidence source |
+| Chunk metadata/hash | PostgreSQL | Session, turn range, role, token count, source integrity |
+| Embedding vector/model version | PostgreSQL/pgvector | Re-embeddable without rewriting chunks or graph history |
+| Atomic fact text | HydraDB | Graph retrieval unit with source span reference |
+| Entities and relationships | HydraDB | Semantic and temporal topology |
+| Ingestion job/outbox state | PostgreSQL | Drives retries and cross-store verification |
+
+Exact chunk boundaries and whether MVP stores fact embeddings only or both fact and chunk embeddings remain benchmark-driven decisions.
 
 ---
 
-## 2. numpy vs FAISS
+## 2. Exact pgvector Search Before Approximate Indexing
 
-**Recommendation: Pure numpy. FAISS is unnecessary.**
+**MVP decision: PostgreSQL/pgvector exact cosine search with a mandatory `context_id` filter.**
 
-| Factor | numpy | FAISS (`faiss-cpu`) |
-|---|---|---|
-| Scale | ~1,200 facts × 384 dims = **1.8 MB** matrix | Same data, indexed |
-| Similarity computation | `np.dot` on normalized vectors: **<1ms** for 1,200 rows | Also <1ms, but adds index build overhead |
-| Dependencies | Already required (transitive via sentence-transformers) | Extra C++ compiled dependency, potential install issues |
-| Complexity | 15 lines of code | Index creation, serialization, re-building on ingestion |
-| Medium tier ceiling | ~15,000 facts × 384 dims = **23 MB**, still **<10ms** | Unnecessary until >100K vectors |
+pgvector performs exact nearest-neighbor search by default. HNSW and IVFFlat trade recall and operational complexity for speed; neither is justified before measurement at LongMemEval scale.
 
-At 1,200 facts, numpy cosine similarity is a single matrix multiplication — there is nothing for FAISS to optimize. Even at the medium tier (~15K facts, which we're not targeting), numpy stays under 10ms. FAISS's IVF/HNSW indexing provides speedup only when brute-force exceeds tens of milliseconds, which requires >100K vectors.
+```sql
+SELECT subject_id, 1 - (embedding <=> :query_embedding) AS cosine_similarity
+FROM memory_embeddings
+WHERE context_id = :context_id
+  AND subject_kind = 'fact'
+  AND is_active = true
+  AND model_name = :model_name
+  AND model_version = :model_version
+ORDER BY embedding <=> :query_embedding
+LIMIT :top_k;
+```
 
-**No new dependency. No index management. No serialization.**
+Add HNSW only after exact-search latency violates an approved target. Any approximate index must be evaluated against exact-search Recall@K and must preserve tenant/context filtering behavior.
 
 ---
 
@@ -56,7 +93,7 @@ At 1,200 facts, numpy cosine similarity is a single matrix multiplication — th
 
 **Reasoning**:
 - **Not the extraction or reader model** — this is a tiny encoder, not a generative LLM. The extraction model (GPT-4o-mini or similar) and the reader model are separate, larger models.
-- **384-dim is ideal for numpy brute-force** — smaller vectors mean faster dot products and less memory. 768-dim models (e.g., `bge-base`) offer marginal quality improvement but double storage and compute for no benefit at our recall-oriented task.
+- **384 dimensions fit the MVP** — compact vectors reduce SQL storage and exact-search work. Larger or newer models require the same golden-data benchmark before replacement.
 - **Well-tested for semantic similarity** — MiniLM-L6-v2 consistently performs well on STS benchmarks and is the most-used sentence-transformer model. For matching question text to fact text (short sentence pairs), it's in the sweet spot.
 - **CPU-only is fine** — at ~5ms per embedding, ingesting 1,200 facts takes ~6 seconds. Query embedding is instant. No GPU needed.
 
@@ -66,198 +103,231 @@ The model is loaded once at process start and shared across ingestion and retrie
 
 ## 4. Three-Phase Retrieval — End to End
 
-### 4.0 In-Memory Embedding Index Structure
+### 4.0 Draft SQL Persistence Contract
 
-```python
-class EmbeddingIndex:
-    """In-process embedding store with haystack_id partitioning. No external dependencies beyond numpy."""
-    
-    def __init__(self, model_name='sentence-transformers/all-MiniLM-L6-v2'):
-        self.model = SentenceTransformer(model_name)
-        self._dirty = True                     # rebuild matrix on next query
-        self._embeddings: dict[int, np.ndarray] = {}  # fact_id → embedding (384,)
-        self._haystacks: dict[int, str] = {}          # fact_id → haystack_id
-        self.fact_ids: list[int] = []          # parallel to rows in self.matrix
-        self.fact_haystacks: list[str] = []    # parallel to rows in self.matrix
-        self.matrix: np.ndarray | None = None  # shape (n_facts, 384), L2-normalized
-    
-    def add(self, fact_id: int, text: str, haystack_id: str):
-        """Called once per Fact at ingestion time."""
-        vec = self.model.encode(text, normalize_embeddings=True)
-        self._embeddings[fact_id] = vec
-        self._haystacks[fact_id] = haystack_id
-        self._dirty = True
-    
-    def remove(self, fact_id: int):
-        """Called when a Fact is superseded (is_current → false)."""
-        self._embeddings.pop(fact_id, None)
-        self._haystacks.pop(fact_id, None)
-        self._dirty = True
-    
-    def _rebuild(self):
-        """Stack all embeddings into a single matrix for batch similarity."""
-        self.fact_ids = list(self._embeddings.keys())
-        self.fact_haystacks = [self._haystacks[fid] for fid in self.fact_ids]
-        if self.fact_ids:
-            self.matrix = np.stack([self._embeddings[fid] for fid in self.fact_ids])
-        else:
-            self.matrix = np.empty((0, 384))
-        self._dirty = False
-    
-    def search(self, query_text: str, haystack_id: str, top_k: int = 10,
-               include_non_current: bool = False) -> list[tuple[int, float]]:
-        """
-        Returns list of (fact_id, cosine_similarity) sorted descending,
-        strictly filtered to the requested haystack_id.
-        """
-        if self._dirty:
-            self._rebuild()
-        if self.matrix is None or len(self.fact_ids) == 0:
-            return []
-        
-        # Filter indices belonging to this haystack
-        mask = [h == haystack_id for h in self.fact_haystacks]
-        if not any(mask):
-            return []
-        
-        scoped_ids = [self.fact_ids[i] for i, m in enumerate(mask) if m]
-        scoped_matrix = self.matrix[mask]
-        
-        query_vec = self.model.encode(query_text, normalize_embeddings=True)
-        # Cosine similarity = dot product on L2-normalized vectors
-        scores = scoped_matrix @ query_vec  # shape (n_scoped_facts,)
-        top_indices = np.argsort(scores)[::-1][:top_k]
-        return [(scoped_ids[i], float(scores[i])) for i in top_indices]
+The schema below establishes responsibilities, not final chunk boundaries. Migration details remain subject to fixture-driven review.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE evidence_chunks (
+    chunk_id TEXT PRIMARY KEY,
+    context_id TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_external_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    turn_start INTEGER NOT NULL,
+    turn_end INTEGER NOT NULL,
+    role TEXT,
+    raw_text TEXT NOT NULL,
+    token_count INTEGER,
+    content_hash TEXT NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE memory_embeddings (
+    embedding_id BIGSERIAL PRIMARY KEY,
+    context_id TEXT NOT NULL,
+    subject_kind TEXT NOT NULL CHECK (subject_kind IN ('fact', 'chunk')),
+    subject_id TEXT NOT NULL,
+    source_chunk_id TEXT NOT NULL REFERENCES evidence_chunks(chunk_id),
+    model_name TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    embedding vector(384) NOT NULL,
+    embedded_content_hash TEXT NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (context_id, subject_kind, subject_id, model_name, model_version)
+);
+
+CREATE TABLE ingestion_jobs (
+    job_id TEXT PRIMARY KEY,
+    context_id TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_chunk_id TEXT NOT NULL REFERENCES evidence_chunks(chunk_id),
+    state TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX memory_embeddings_scope_idx
+    ON memory_embeddings (context_id, subject_kind, is_active);
+
+CREATE INDEX evidence_chunks_source_idx
+    ON evidence_chunks (context_id, session_id, turn_start);
 ```
 
-> [!NOTE]
-> The `remove()` method is called when `SUPERSEDES` marks a fact as `is_current = false`. For `knowledge-update` questions specifically, we need historical facts too — the caller can maintain a **second** `EmbeddingIndex` instance that retains all embeddings (never calls `remove`), or re-add superseded facts temporarily. The primary index only holds `is_current = true` facts.
+Superseded embeddings remain durable for historical/temporal retrieval. `is_active` controls default latest-state seeding; it does not delete history. Re-embedding inserts a new model-version row rather than mutating source chunks.
 
-### 4.1 Ingestion Pseudocode
+### 4.1 Generic Ingestion Pseudocode
+
+Source adapters first map payloads into canonical context sessions/records. LongMemEval adapter is one caller of this function, not a branch inside it.
 
 ```python
-def ingest_session(session: dict, hydra_driver, embedding_index: EmbeddingIndex, haystack_id: str):
+def ingest_context_session(session: ContextSession, hydra_driver, sql_store, embedder):
     """
-    Ingest one session from longmemeval_s_cleaned.json into HydraDB + embedding index.
-    Called once per session, in haystack order, with explicit haystack_id.
+    Ingest one session into PostgreSQL + HydraDB using idempotent job state.
+    Called once per canonical source session. No benchmark-specific fields.
     """
-    session_id = session['session_id']
-    date_str = session['date']              # e.g. '2024-03-15'
+    context_id = session.context_id
+    session_id = session.session_id
+    date_str = session.occurred_at
     date_epoch = date_str_to_epoch(date_str)
     now_epoch = int(time.time())
 
     # 1. Create Session node
     hydra_driver.execute(
-        "CREATE (s:Session {id: $id, haystack_id: $hid, session_id: $sid, date: $date, "
-        "date_epoch: $dep, turn_count: $tc, haystack_index: $hi})",
-        id=alloc_session_id(), hid=haystack_id, sid=session_id, date=date_str,
-        dep=date_epoch, tc=len(session['turns']), hi=session['index']
+        "CREATE (s:Session {id: $id, context_id: $hid, session_id: $sid, date: $date, "
+        "date_epoch: $dep, turn_count: $tc, source_index: $hi})",
+        id=alloc_session_id(), hid=context_id, sid=session_id, date=date_str,
+        dep=date_epoch, tc=len(session.records), hi=session.source_index
     )
 
-    for turn_idx, turn in enumerate(session['turns']):
+    for turn_idx, turn in enumerate(session.records):
         turn_id = alloc_turn_id()
+        chunk = build_immutable_chunk(
+            context_id=context_id,
+            session_id=session_id,
+            turn_index=turn_idx,
+            role=turn.actor_role,
+            raw_text=turn.content,
+            observed_at=date_str,
+        )
+        sql_store.upsert_chunk_and_job(chunk, state='chunk_stored')
 
         # 2. Create Turn node + HAS_TURN edge
         hydra_driver.execute(
-            "CREATE (s:Session {id: $sid, haystack_id: $hid})-[:HAS_TURN {turn_index: $ti}]->"
-            "(t:Turn {id: $tid, haystack_id: $hid, turn_index: $ti, role: $role, "
-            "content: $content, has_answer: $ha, session_id: $sessid})",
-            sid=session_node_id, hid=haystack_id, tid=turn_id, ti=turn_idx,
-            role=turn['role'], content=turn['content'],
-            ha=turn.get('has_answer', False), sessid=session_id
+            "CREATE (s:Session {id: $sid, context_id: $hid})-[:HAS_TURN {turn_index: $ti}]->"
+            "(t:Turn {id: $tid, context_id: $hid, turn_index: $ti, role: $role, "
+            "source_chunk_id: $cid, content_hash: $hash, session_id: $sessid})",
+            sid=session_node_id, hid=context_id, tid=turn_id, ti=turn_idx,
+            role=turn.actor_role, cid=chunk.id, hash=chunk.content_hash,
+            sessid=session_id
         )
 
         # 3. LLM: Extract atomic facts from turn text with strict entity_type enum
         # Prompt enforces JSON schema with enum:
-        # ['person', 'pet', 'place', 'organization', 'event', 'creative_work', 
+        # ['person', 'pet', 'place', 'organization', 'event', 'creative_work',
         #  'product', 'activity', 'preference', 'topic', 'other']
-        facts = llm_extract_facts(turn['content'], turn['role'], session_id)
-        # Returns: [{"text": "...", "entities": [{"name": "...", "type": "<VALID_ENUM>"}], 
+        facts = llm_extract_facts(turn.content, turn.actor_role, session_id)
+        # Returns: [{"text": "...", "entities": [{"name": "...", "type": "<VALID_ENUM>"}],
         #            "valid_from_hint": epoch|None}, ...]
 
         for fact_data in facts:
             fact_id = alloc_fact_id()
             valid_from = fact_data.get('valid_from_hint') or date_epoch
-            valid_to = 9999999999  # open-ended until superseded
+            valid_to = 9999999999  # world-validity interval; not knowledge recency
+            memory_type = validate_memory_type(fact_data.get('memory_type', 'semantic'))
+            scope_type, scope_id = assign_scope(fact_data, session, context_id)
 
             # 4. Create Fact node + EXTRACTED_FROM edge
             hydra_driver.execute(
-                "CREATE (f:Fact {id: $fid, haystack_id: $hid, text: $text, speaker: $spk, "
-                "session_id: $sid, valid_from: $vf, valid_to: $vt, "
+                "CREATE (f:Fact {id: $fid, context_id: $hid, text: $text, speaker: $spk, "
+            "session_id: $sid, memory_type: $mt, scope_type: $st, scope_id: $scope, "
+            "source_chunk_id: $cid, source_start: $start, source_end: $end, content_hash: $hash, "
+            "observed_at: $observed, superseded_at: 9999999999, valid_from: $vf, valid_to: $vt, "
                 "created_at: $ca, is_current: true})"
-                "-[:EXTRACTED_FROM]->(t:Turn {id: $tid, haystack_id: $hid})",
-                fid=fact_id, hid=haystack_id, text=fact_data['text'], spk=turn['role'],
-                sid=session_id, vf=valid_from, vt=valid_to,
+                "-[:EXTRACTED_FROM]->(t:Turn {id: $tid, context_id: $hid})",
+                fid=fact_id, hid=context_id, text=fact_data['text'], spk=turn.actor_role,
+                sid=session_id, mt=memory_type, st=scope_type, scope=scope_id,
+                cid=chunk.id, start=fact_data['source_start'], end=fact_data['source_end'],
+                hash=chunk.content_hash, observed=date_epoch, vf=valid_from, vt=valid_to,
                 ca=now_epoch, tid=turn_id
             )
 
-            # 5. Compute embedding and add to in-process index (scoped to haystack_id)
-            embedding_index.add(fact_id, fact_data['text'], haystack_id=haystack_id)
+            # 5. Persist versioned fact embedding in PostgreSQL/pgvector
+            sql_store.upsert_embedding(
+                context_id=context_id,
+                subject_kind='fact',
+                subject_id=str(fact_id),
+                source_chunk_id=chunk.id,
+                vector=embedder.encode(fact_data['text']),
+                embedded_content_hash=hash_text(fact_data['text']),
+                model_name=embedder.model_name,
+                model_version=embedder.model_version,
+            )
 
-            # 6. Resolve entities: for each entity in the fact (scoped to haystack_id)
+            # 6. Resolve entities: for each entity in the fact (scoped to context_id)
             for ent in fact_data['entities']:
                 entity_id = resolve_or_create_entity(
-                    hydra_driver, ent['name'], ent['type'], haystack_id
+                    hydra_driver, ent['name'], ent['type'], context_id
                 )
                 # 6a. Create ABOUT edge
                 hydra_driver.execute(
-                    "CREATE (f:Fact {id: $fid, haystack_id: $hid})-[:ABOUT]->(e:Entity {id: $eid, haystack_id: $hid})",
-                    fid=fact_id, eid=entity_id, hid=haystack_id
+                    "CREATE (f:Fact {id: $fid, context_id: $hid})-[:ABOUT]->(e:Entity {id: $eid, context_id: $hid})",
+                    fid=fact_id, eid=entity_id, hid=context_id
                 )
 
             # 7. Check for knowledge updates (hybrid: deterministic + LLM)
-            superseded = detect_supersession(hydra_driver, fact_id, fact_data, haystack_id)
+            superseded = detect_supersession(hydra_driver, fact_id, fact_data, context_id)
             if superseded:
                 old_fact_id = superseded['old_fact_id']
                 # 7a. Create SUPERSEDES edge
                 hydra_driver.execute(
-                    "CREATE (f_new:Fact {id: $new, haystack_id: $hid})-[:SUPERSEDES "
-                    "{superseded_at: $at}]->(f_old:Fact {id: $old, haystack_id: $hid})",
-                    new=fact_id, old=old_fact_id, at=now_epoch, hid=haystack_id
+                    "CREATE (f_new:Fact {id: $new, context_id: $hid})-[:SUPERSEDES "
+                    "{superseded_at: $at}]->(f_old:Fact {id: $old, context_id: $hid})",
+                    new=fact_id, old=old_fact_id, at=now_epoch, hid=context_id
                 )
-                # 7b. Mark old fact as no longer current
-                hydra_driver.execute(
-                    "MATCH (f:Fact {id: $old, haystack_id: $hid}) SET f.is_current = false, "
-                    "f.valid_to = $vt",
-                    old=old_fact_id, vt=valid_from, hid=haystack_id
+                # 7b. Close knowledge-time interval. Close world validity only
+                # when classification says this was a real state change.
+                close_superseded_fact(
+                    hydra_driver,
+                    old_fact_id=old_fact_id,
+                    superseded_at=date_epoch,
+                    close_validity=superseded.get('closes_validity', False),
+                    valid_to=valid_from,
+                    context_id=context_id,
                 )
-                # 7c. Remove old fact from primary embedding index
-                embedding_index.remove(old_fact_id)
+                # 7c. Preserve historical vector; exclude it from latest-state seeding
+                sql_store.set_embedding_active('fact', str(old_fact_id), False)
 
-            # 8. Create STATED_BY edge to User/Assistant entity (scoped to haystack_id)
-            speaker_entity_id = 9999999 if turn['role'] == 'user' else 9999998
+            # 8. Create STATED_BY edge to User/Assistant entity (scoped to context_id)
+            speaker_entity_id = 9999999 if turn.actor_role == 'user' else 9999998
             hydra_driver.execute(
-                "CREATE (f:Fact {id: $fid, haystack_id: $hid})-[:STATED_BY]->"
-                "(e:Entity {id: $eid, haystack_id: $hid})",
-                fid=fact_id, eid=speaker_entity_id, hid=haystack_id
+                "CREATE (f:Fact {id: $fid, context_id: $hid})-[:STATED_BY]->"
+                "(e:Entity {id: $eid, context_id: $hid})",
+                fid=fact_id, eid=speaker_entity_id, hid=context_id
             )
 
+        verify_graph_chunk_links(hydra_driver, sql_store, chunk.id, context_id)
+        sql_store.mark_ingestion_job(chunk.id, state='completed')
+
 VALID_ENTITY_TYPES = {
-    'person', 'pet', 'place', 'organization', 'event', 
+    'person', 'pet', 'place', 'organization', 'event',
     'creative_work', 'product', 'activity', 'preference', 'topic', 'other'
 }
 
-def resolve_or_create_entity(hydra_driver, name: str, entity_type: str, haystack_id: str) -> int:
+def resolve_or_create_entity(hydra_driver, name: str, entity_type: str, context_id: str) -> int:
     """
-    Deterministic/canonical entity resolution with strict enum enforcement,
-    scoped strictly to the current haystack_id.
+    Illustrative M6 graph-write sketch only. M5 now implements the prior
+    decision layer: deterministic context-scoped matching, followed by bounded
+    provider-neutral LLM selection for ambiguous supplied candidates. This
+    pseudocode must consume that decision rather than perform an unrestricted
+    lookup or provider call itself.
     """
     canonical_name = name.strip().lower()
+    selector_key = f"{context_id}::{canonical_name}"
     # Enforce enum whitelist; map unknown/invented types to 'other'
     sanitized_type = entity_type if entity_type in VALID_ENTITY_TYPES else 'other'
 
-    # Check for existing canonical entity in this haystack
+    # Check for existing canonical entity in this context
     existing = hydra_driver.execute(
-        "MATCH (e:Entity {canonical_name: $cname, haystack_id: $hid}) RETURN e.id AS id",
-        cname=canonical_name, hid=haystack_id
+        "MATCH (e:Entity {canonical_name: $cname, context_id: $hid}) RETURN e.id AS id",
+        cname=canonical_name, hid=context_id
     )
     if existing:
         return existing[0]['id']
 
-    # Check if this name is an alias of an existing entity in this haystack
+    # Check if this name is an alias of an existing entity in this context
     alias_match = hydra_driver.execute(
-        "MATCH (e:Entity {haystack_id: $hid})-[:HAS_ALIAS]->(a:Alias {canonical_alias: $cname, haystack_id: $hid}) RETURN e.id AS id",
-        cname=canonical_name, hid=haystack_id
+        "MATCH (e:Entity {context_id: $hid})-[:HAS_ALIAS]->(a:Alias {canonical_alias: $cname, context_id: $hid}) RETURN e.id AS id",
+        cname=canonical_name, hid=context_id
     )
     if alias_match:
         return alias_match[0]['id']
@@ -265,8 +335,9 @@ def resolve_or_create_entity(hydra_driver, name: str, entity_type: str, haystack
     # New entity: create Entity node
     new_id = alloc_entity_id()
     hydra_driver.execute(
-        "CREATE (e:Entity {id: $id, haystack_id: $hid, name: $name, canonical_name: $cname, entity_type: $etype})",
-        id=new_id, hid=haystack_id, name=name, cname=canonical_name, etype=sanitized_type
+        "CREATE (e:Entity {id: $id, context_id: $hid, name: $name, canonical_name: $cname, selector_key: $skey, entity_type: $etype})",
+        id=new_id, hid=context_id, name=name, cname=canonical_name,
+        skey=selector_key, etype=sanitized_type
     )
     return new_id
 ```
@@ -274,57 +345,68 @@ def resolve_or_create_entity(hydra_driver, name: str, entity_type: str, haystack
 ### 4.2 Retrieval Pseudocode — Three Phases
 
 ```python
-def retrieve(question: dict, hydra_driver, embedding_index: EmbeddingIndex) -> str:
+def retrieve(query: ContextQuery, hydra_driver, sql_store, embedder) -> str:
     """
-    Three-phase retrieval for a single LongMemEval question.
-    Returns the generated answer string (the 'hypothesis').
+    Generic three-phase retrieval. LongMemEval maps its question record into
+    ContextQuery and maps the returned answer to the benchmark hypothesis.
     """
-    q_text = question['question']
-    q_type = question['question_type']
-    q_date = question.get('question_date')
-    q_haystack_id = question.get('haystack_id', question['question_id'])
-    is_abstention = question['question_id'].endswith('_abs')
+    q_text = query.text
+    strategy_hint = query.strategy_hint  # optional; never required
+    q_date = query.query_time
+    q_context_id = query.context_id
 
     # ================================================================
-    # PHASE 1: Semantic seeding (in-process, numpy, scoped by haystack_id)
+    # PHASE 1: Durable semantic seeding (PostgreSQL/pgvector, scoped by context_id)
     # ================================================================
     top_k = 10  # tunable
 
-    seed_results = embedding_index.search(q_text, haystack_id=q_haystack_id, top_k=top_k)
-    # seed_results: [(fact_id, cosine_sim), ...] strictly from q_haystack_id
+    query_vector = embedder.encode(q_text)
+    seed_results = sql_store.search_embeddings(
+        query_vector=query_vector,
+        context_id=q_context_id,
+        subject_kind='fact',
+        model_name=embedder.model_name,
+        model_version=embedder.model_version,
+        # Historical replay needs inactive embeddings so graph knowledge-time
+        # filtering can reconstruct what was current at question_date.
+        active_only=(q_date is None),
+        top_k=top_k,
+    )
+    # seed_results: [(fact_id, cosine_sim), ...] strictly from q_context_id
 
     seed_fact_ids = [fid for fid, _ in seed_results]
     seed_scores = {fid: score for fid, score in seed_results}
 
     # ================================================================
-    # PHASE 2: Graph expansion (HydraDB, scoped by haystack_id)
+    # PHASE 2: Graph expansion (HydraDB, scoped by context_id)
     # ================================================================
 
-    # 2a. Collect entities connected to seed facts within the haystack
+    # 2a. Collect entities connected to seed facts within the context
     seed_entities = set()
     for fid in seed_fact_ids:
         result = hydra_driver.execute(
-            "MATCH (f:Fact {id: $fid, haystack_id: $hid})-[:ABOUT]->(e:Entity {haystack_id: $hid}) "
+            "MATCH (f:Fact {id: $fid, context_id: $hid})-[:ABOUT]->(e:Entity {context_id: $hid}) "
             "RETURN e.id AS eid, e.canonical_name AS name",
-            fid=fid, hid=q_haystack_id
+            fid=fid, hid=q_context_id
         )
         for row in result:
             seed_entities.add((row['eid'], row['name']))
 
-    entity_names = [name for _, name in seed_entities]
+    entity_selector_keys = [f"{q_context_id}::{name}" for _, name in seed_entities]
 
     # 2b. Graph expansion via algo.MSpaths — find facts connected
-    #     through shared entities across sessions within this haystack
+    #     through shared entities across sessions within this context
     expanded_facts = {}  # fact_id → {text, hop_count, path_count}
 
-    if len(entity_names) >= 2:
+    if len(entity_selector_keys) >= 2:
         # Multi-entity bridging: find paths between seed entities
         # through ABOUT edges (Fact↔Entity connections)
         paths = hydra_driver.execute(
             "CALL algo.MSpaths({"
             "  sourceLabel: 'Entity',"
-            "  sourceProperty: 'canonical_name',"
-            "  sourceValues: $names,"
+            "  sourceProperty: 'selector_key',"
+            "  sourceValues: $selector_keys,"
+            "  targetValues: $selector_keys,"
             "  pairwise: true,"
             "  relTypes: ['ABOUT'],"
             "  relDirection: 'both',"
@@ -333,13 +415,13 @@ def retrieve(question: dict, hydra_driver, embedding_index: EmbeddingIndex) -> s
             "  fairRelationshipVariants: true,"
             "  resultLimit: 100"
             "}) YIELD path RETURN path",
-            names=entity_names
+            selector_keys=entity_selector_keys
         )
-        # Parse paths to extract intermediate Fact nodes belonging to this haystack
+        # Parse paths to extract intermediate Fact nodes belonging to this context
         for path in paths:
             for node, hops in extract_facts_from_path(path):
-                # Extra safety check: verify haystack_id matches
-                if node.get('haystack_id') == q_haystack_id:
+                # Extra safety check: verify context_id matches
+                if node.get('context_id') == q_context_id:
                     if node['id'] not in expanded_facts:
                         expanded_facts[node['id']] = {
                             'text': node.get('text', ''),
@@ -350,13 +432,13 @@ def retrieve(question: dict, hydra_driver, embedding_index: EmbeddingIndex) -> s
                         expanded_facts[node['id']]['path_count'] += 1
 
     # 2c. Single-entity expansion: for each seed entity, get all connected
-    #     current facts in the same haystack
+    #     current facts in the same context
     for eid, _ in seed_entities:
         result = hydra_driver.execute(
-            "MATCH (f:Fact {haystack_id: $hid})-[:ABOUT]->(e:Entity {id: $eid, haystack_id: $hid}) "
+            "MATCH (f:Fact {context_id: $hid})-[:ABOUT]->(e:Entity {id: $eid, context_id: $hid}) "
             "WHERE f.is_current = true "
             "RETURN f.id AS fid, f.text AS text",
-            eid=eid, hid=q_haystack_id
+            eid=eid, hid=q_context_id
         )
         for row in result:
             if row['fid'] not in expanded_facts and row['fid'] not in seed_scores:
@@ -366,47 +448,52 @@ def retrieve(question: dict, hydra_driver, embedding_index: EmbeddingIndex) -> s
                     'path_count': 1
                 }
 
-    # 2d. Knowledge-update expansion: follow SUPERSEDES chains within the haystack
-    if q_type == 'knowledge-update':
+    # 2d. Knowledge-update expansion: follow SUPERSEDES chains within the context
+    if strategy_hint == 'knowledge-update' or detects_update_query(q_text):
         for fid in seed_fact_ids:
             result = hydra_driver.execute(
-                "MATCH (f:Fact {id: $fid, haystack_id: $hid})-[:SUPERSEDES*1..5]->(f_old:Fact {haystack_id: $hid}) "
+                "MATCH (f:Fact {id: $fid, context_id: $hid})-[:SUPERSEDES*1..5]->(f_old:Fact {context_id: $hid}) "
                 "RETURN f_old.id AS fid, f_old.text AS text",
-                fid=fid, hid=q_haystack_id
+                fid=fid, hid=q_context_id
             )
             for row in result:
                 expanded_facts[row['fid']] = {
                     'text': row['text'], 'hop_count': 1, 'path_count': 1
                 }
-            # Also check if seed was superseded BY something newer in this haystack
+            # Also check if seed was superseded BY something newer in this context
             result = hydra_driver.execute(
-                "MATCH (f_new:Fact {haystack_id: $hid})-[:SUPERSEDES*1..5]->(f:Fact {id: $fid, haystack_id: $hid}) "
+                "MATCH (f_new:Fact {context_id: $hid})-[:SUPERSEDES*1..5]->(f:Fact {id: $fid, context_id: $hid}) "
                 "RETURN f_new.id AS fid, f_new.text AS text",
-                fid=fid, hid=q_haystack_id
+                fid=fid, hid=q_context_id
             )
             for row in result:
                 expanded_facts[row['fid']] = {
                     'text': row['text'], 'hop_count': 1, 'path_count': 1
                 }
 
-    # 2e. Temporal filtering (for temporal-reasoning questions within haystack)
-    if q_type == 'temporal-reasoning' and q_date:
+    # 2e. Historical replay cutoff for every question
+    if q_date:
         query_epoch = date_str_to_epoch(q_date)
-        # Re-filter: keep only facts valid at query time
-        temporal_filter_ids = set()
+        observable_ids = set()
         all_candidate_ids = list(seed_scores.keys()) + list(expanded_facts.keys())
         for fid in all_candidate_ids:
             result = hydra_driver.execute(
-                "MATCH (f:Fact {id: $fid, haystack_id: $hid}) "
-                "WHERE f.valid_from <= $qe AND f.valid_to >= $qe "
+                "MATCH (f:Fact {id: $fid, context_id: $hid}) "
+                "WHERE f.observed_at <= $qe AND f.superseded_at > $qe "
                 "RETURN f.id AS fid",
-                fid=fid, hid=q_haystack_id, qe=query_epoch
+                fid=fid, hid=q_context_id, qe=query_epoch
             )
             for row in result:
-                temporal_filter_ids.add(row['fid'])
-        # Remove facts outside the validity window
-        seed_scores = {k: v for k, v in seed_scores.items() if k in temporal_filter_ids}
-        expanded_facts = {k: v for k, v in expanded_facts.items() if k in temporal_filter_ids}
+                observable_ids.add(row['fid'])
+        seed_scores = {k: v for k, v in seed_scores.items() if k in observable_ids}
+        expanded_facts = {k: v for k, v in expanded_facts.items() if k in observable_ids}
+
+    # Temporal-reasoning questions apply a second, distinct validity-time filter.
+    if strategy_hint == 'temporal-reasoning' or detects_temporal_query(q_text):
+        target_epoch = resolve_target_epoch(q_text, q_date, hydra_driver, q_context_id)
+        seed_scores, expanded_facts = filter_by_validity_window(
+            seed_scores, expanded_facts, target_epoch, hydra_driver, q_context_id
+        )
 
     # ================================================================
     # PHASE 3: Hybrid scoring + context assembly
@@ -438,30 +525,44 @@ def retrieve(question: dict, hydra_driver, embedding_index: EmbeddingIndex) -> s
 
     # ---- Abstention check ----
     ABSTENTION_THRESHOLD = 0.25
-    if is_abstention or (ranked and ranked[0][1]['semantic'] < ABSTENTION_THRESHOLD
-                         and len(expanded_facts) == 0):
+    if not ranked or (ranked[0][1]['semantic'] < ABSTENTION_THRESHOLD
+                      and len(expanded_facts) == 0):
         # Low confidence: best semantic score is weak AND no graph connections found
         # → abstain rather than hallucinate
         return "I don't have that information in my memory."
 
     # ---- Assemble context for reader LLM ----
-    context_facts = []
+    context_evidence = []
     for fid, scores in ranked[:top_n]:
-        # Fetch full fact text + provenance (strictly scoped by haystack_id)
+        # Fetch graph fact + SQL source pointer (strictly scoped by context_id)
         result = hydra_driver.execute(
-            "MATCH (f:Fact {id: $fid, haystack_id: $hid})-[:EXTRACTED_FROM]->(t:Turn {haystack_id: $hid})"
-            "<-[:HAS_TURN]-(s:Session {haystack_id: $hid}) "
+            "MATCH (f:Fact {id: $fid, context_id: $hid})-[:EXTRACTED_FROM]->(t:Turn {context_id: $hid})"
+            "<-[:HAS_TURN]-(s:Session {context_id: $hid}) "
             "RETURN f.text AS fact, f.speaker AS speaker, "
+            "f.source_chunk_id AS chunk_id, f.source_start AS source_start, "
+            "f.source_end AS source_end, f.content_hash AS content_hash, "
             "s.date AS date, s.session_id AS session_id",
-            fid=fid, hid=q_haystack_id
+            fid=fid, hid=q_context_id
         )
         for row in result:
-            context_facts.append(
-                f"[{row['date']}, {row['speaker']}]: {row['fact']}"
+            evidence = sql_store.load_evidence_progressively(
+                chunk_id=row['chunk_id'],
+                expected_hash=row['content_hash'],
+                source_start=row['source_start'],
+                source_end=row['source_end'],
+                question=q_text,
+                levels=('source_span', 'neighboring_turn', 'full_chunk'),
             )
+            context_evidence.append({
+                'fact': row['fact'],
+                'evidence': evidence,
+                'speaker': row['speaker'],
+                'date': row['date'],
+                'session_id': row['session_id'],
+            })
 
     # ---- Generate answer with reader LLM ----
-    answer = reader_llm_generate(q_text, context_facts, q_type)
+    answer = reader_llm_generate(q_text, context_evidence, strategy_hint)
     return answer
 ```
 
@@ -476,16 +577,16 @@ def retrieve(question: dict, hydra_driver, embedding_index: EmbeddingIndex) -> s
 
 ### `algo.MSpaths` — Confirmed Compatibility
 
-The `algo.MSpaths` call in Phase 2b is valid against the [confirmed Cypher constraints](file:///home/aryan-sherigar/projects/hydradb-hackathon/hydradb/cypher-compat.md):
+The `algo.MSpaths` call in Phase 2b is valid against the [confirmed Cypher constraints](../hydradb/cypher-compat.md):
 
 | Constraint | Status |
 |---|---|
-| Config map with named keys | ✅ Uses `sourceLabel`, `sourceProperty`, `sourceValues`, etc. |
+| Config map with named keys | ✅ Uses `sourceLabel`, `sourceProperty`, `sourceValues`, and `targetValues` |
 | `YIELD path` + `RETURN path` — only yielded columns | ✅ |
 | `relTypes` as a list | ✅ `['ABOUT']` — single type to avoid ambiguity |
 | `maxLen` required (bounded) | ✅ `maxLen: 4` |
 | No `WITH` filtering, no `IN`, no `CONTAINS` | ✅ Not used |
-| `sourceValues` accepts a list parameter | ✅ List of strings via `$names` parameter |
+| `sourceValues`/`targetValues` accept list parameters | ✅ Same list of context-qualified keys via `$selector_keys` |
 | One statement per request | ✅ |
 
 > [!NOTE]
@@ -495,47 +596,76 @@ The `algo.MSpaths` call in Phase 2b is valid against the [confirmed Cypher const
 
 ## 5. Abstention Integration
 
-Abstention is **not a separate system** — it's a threshold check in Phase 3 scoring:
+Abstention is a runtime evidence decision. It must never inspect `question_id` suffixes, `has_answer`, expected answers, or any other evaluation-only field.
 
-```
-IF  best_semantic_score < 0.25  AND  graph_expansion_found_nothing:
-    → Abstain ("I don't have that information in my memory.")
+Initial MVP gate:
+
+```text
+IF no ranked evidence:
+    -> abstain
+ELSE IF semantic support is below threshold
+        AND graph expansion adds no corroborating evidence:
+    -> abstain
+ELSE IF temporal resolution fails or contradiction remains unresolved:
+    -> abstain with the corresponding reason
 ELSE:
-    → Proceed to reader LLM with assembled context
+    -> generate from source-linked context
 ```
 
-The two signals are complementary:
-- **Semantic score alone** can be low for poorly-worded questions about real facts → don't abstain yet
-- **Graph expansion alone** can find spurious connections to distractor-session entities → don't trust structure alone
-- **Both weak** → high confidence the information genuinely isn't in memory → abstain
-
-The `0.25` threshold is a starting point to tune on the ~50 abstention questions in the dataset (questions where `question_id` ends with `_abs`).
+The numeric threshold is uncalibrated until a held-out development split exists. Tune it on retrieval signals and answer behavior, then report abstention precision/recall separately on the untouched evaluation set.
 
 ---
 
-## 6. Schema Diff
+## 6. Graph and SQL Schema Diff
 
-**No changes needed to `graph_schema_proposal.md`.**
+`graph_schema_proposal.md` now carries the cross-store provenance contract:
 
-Embeddings cannot be stored as HydraDB properties (float-array not supported), so no new column is added to the Fact property table. The embedding index is a purely in-process Python structure (`EmbeddingIndex` class above), keyed by `Fact.id`.
+- `Turn.source_chunk_id` and `Turn.content_hash` point to immutable SQL evidence.
+- `Fact.source_chunk_id`, `source_start`, and `source_end` identify the supporting span.
+- `Fact.observed_at` separates knowledge-availability time from real-world validity time.
+- `Fact.superseded_at` closes the knowledge-time interval without necessarily changing world validity.
+- `Fact.memory_type`, `scope_type`, and `scope_id` support memory taxonomy and hierarchy.
+- `Entity.selector_key` qualifies native path selectors with `context_id`.
 
-The join contract is:
-- **Write path**: `Fact.id` (int) is written to both HydraDB (as node identity) and `EmbeddingIndex._embeddings` (as dict key) during ingestion
-- **Read path**: Phase 1 returns `Fact.id` values, which Phase 2 uses in HydraDB `MATCH (f:Fact {id: $fid})` queries
-- **Delete path**: When `SUPERSEDES` marks a fact `is_current = false`, `EmbeddingIndex.remove(fact_id)` is called in the same ingestion function
+Join and lifecycle contract:
 
-**The only new artifact is the `EmbeddingIndex` class**, which exists as Python code alongside the ingestion/retrieval scripts, not as a schema change.
+- **Write**: persist immutable chunk and ingestion job in PostgreSQL, write/verify HydraDB nodes and edges, persist versioned embeddings, then mark job complete.
+- **Read**: pgvector returns fact identifiers; HydraDB expands/ranks graph evidence; PostgreSQL returns verified source spans and optional wider context.
+- **Supersede**: preserve old graph facts and embeddings for history; set latest-state flags without deleting evidence.
+- **Recover**: replay incomplete jobs idempotently and verify both stores before completion.
 
 ---
 
-## 7. Summary of Decisions
+## 7. Context Construction and Summary of Decisions
 
-| Decision | Choice | Key Reason |
+### 7.1 Selective Evidence vs Full Raw Chunk
+
+**MVP decision: progressive evidence expansion, not unconditional full-chunk injection.**
+
+Context construction proceeds through bounded levels:
+
+1. **Fact + exact source span** — smallest evidence directly supporting the fact.
+2. **Neighboring sentence or turn** — add when the span contains unresolved pronouns, negation, comparison, or temporal language.
+3. **Full raw chunk** — use only when narrower evidence remains ambiguous or the reader explicitly needs broader narrative context.
+
+Every level includes speaker, session, timestamp, chunk identifier, and content hash. The reader receives the smallest sufficient context under a token budget. Raw chunks remain retrievable for audit even when only a span enters the prompt.
+
+This is a benchmarked policy, not a permanent heuristic. Compare selective evidence against full-chunk baselines using answer accuracy, evidence recall, false-answer rate, context tokens, and latency.
+
+### 7.2 Approved MVP Decisions
+
+| Decision | MVP choice | Reason / status |
 |---|---|---|
-| Embedding storage | In-process Python dict + numpy array | HydraDB has no array property type |
-| Similarity engine | numpy brute-force | <1ms at 1,200 facts; FAISS adds complexity for zero benefit |
-| Embedding model | `all-MiniLM-L6-v2` (384-dim, 22M params) | Smallest/fastest sentence-transformer; CPU-only; not the extraction or reader model |
-| Phase 2 traversal | `algo.MSpaths` for multi-entity bridging + targeted MATCH for SUPERSEDES/single-entity | Separates concerns; avoids mixing rel types in one MSpaths call |
-| Hybrid scoring | `0.6 × semantic + 0.4 × structural` | Simple weighted combination; no learned ranker |
-| Abstention | Threshold on (best_semantic_score, graph_expansion_count) | Not a separate system; integrated into Phase 3 scoring |
-| `SAME_AS` in Phase 2 | **Removed** — was already dropped from schema | Co-reference handled by `HAS_ALIAS` |
+| Raw chunk storage | PostgreSQL | Durable canonical evidence; exact columns still fixture-driven |
+| Embedding storage | PostgreSQL + pgvector | Persistence, model versioning, SQL filters, exact/ANN path |
+| Similarity engine | Exact pgvector cosine search | Preserve recall at current scale; benchmark before HNSW/IVFFlat |
+| Embedding target | Fact embeddings first; benchmark chunk embeddings | Final fact-only vs fact-plus-chunk choice remains open |
+| Embedding model | `all-MiniLM-L6-v2` (384 dimensions) | Initial reproducible baseline; adapter-bound and replaceable |
+| Phase 2 traversal | Scoped `algo.MSpaths` plus targeted `MATCH` queries | Graph-native expansion with context-qualified selector keys |
+| Hybrid scoring | Initial `0.6 semantic + 0.4 structural` | Uncalibrated starting point; must be tuned on development data |
+| Reader context | Progressive span -> neighbor -> full chunk | Reduce distractors while retaining recoverable source context |
+| Superseded evidence | Preserve; mark inactive for latest-state seeding | Historical and temporal questions require old states |
+| Abstention | Evidence/temporal/contradiction gate | No benchmark-label leakage |
+| Cross-store writes | Idempotent job/outbox + verification | PostgreSQL and HydraDB cannot share one transaction |
+| Organization memory | Deferred | Requires tenant authorization and promotion policy |
+| `SAME_AS` | Removed | Co-reference handled by canonical entities and `HAS_ALIAS` |

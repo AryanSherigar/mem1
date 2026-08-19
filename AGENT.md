@@ -1,5 +1,7 @@
 # Agent Memory Engineering Instructions
 
+# the file FINAL_ARCHITECTURE.md is the source of final truth and it is to be followed. Not the below details
+
 This document provides strict, programmatic constraints and reference material for agents working on the HydraDB LongMemEval codebase. You MUST adhere to these constraints to ensure correct benchmark evaluation and database compatibility.
 
 ## 1. Codebase Structure
