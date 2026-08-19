@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import uuid
 import json
 
+from context_memory.core.config import Config
 from context_memory.core.logging import get_logger, timed_operation
 from context_memory.core.models import ContextBatch, ContextRecord, SourceDescriptor
 from context_memory.ingestion.orchestrator import IngestionOrchestrator
@@ -22,13 +23,15 @@ class MemoryEngine:
         retrieval_engine: HybridRetrievalEngine,
         llm_client: LLMClient,
         pg_connection: object,
-        hydration_manager: HydrationManager | None = None
+        hydration_manager: HydrationManager | None = None,
+        config: Config | None = None,
     ):
         self._orchestrator = orchestrator
         self._retrieval_engine = retrieval_engine
         self._llm = llm_client
         self._pg = pg_connection
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._config = config or Config()
+        self._executor = ThreadPoolExecutor(max_workers=self._config.ingestion_executor_max_workers)
         self._hydration_manager = hydration_manager
 
     def add_turn_async(self, context_id: str, session_id: str, role: str, content: str, timestamp: datetime) -> None:

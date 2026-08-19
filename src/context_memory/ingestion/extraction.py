@@ -7,6 +7,7 @@ from hashlib import sha256
 import uuid
 from pydantic import BaseModel, Field
 
+from context_memory.core.config import Config
 from context_memory.core.errors import ContractValidationError
 from context_memory.ingestion.ports import ExtractionStore, Extractor
 from context_memory.core.enums import MemoryScope, MemoryType
@@ -130,10 +131,11 @@ class ExtractionResponse(BaseModel):
     drafts: list[ExtractedDraft]
 
 class LLMExtractionService:
-    def __init__(self, llm_client, store: ExtractionStore, context_repo) -> None:
+    def __init__(self, llm_client, store: ExtractionStore, context_repo, config: Config | None = None) -> None:
         self._llm = llm_client
         self._store = store
         self._context_repo = context_repo
+        self._config = config or Config()
 
     def extract(self, batch: ContextBatch, record: ContextRecord, chunk: Chunk) -> ExtractionResult:
         if chunk.context_id != batch.context_id or chunk.source_record_id != record.record_id:
@@ -142,20 +144,21 @@ class LLMExtractionService:
         # Phase 1: Context Assembly
         buffer_messages = self._context_repo.get_conversation_buffer(batch.context_id, record.session_id, limit=10)
         candidate_facts = self._context_repo.get_top_candidate_facts(batch.context_id, record.content, limit=5)
-        
-        system_prompt = (
-            "You are an expert extraction AI. Extract atomic facts from the current turn.\n"
-            "Identify the appropriate action (ADD, UPDATE, DELETE).\n"
-            "If updating an existing state or property, specify a predicate_key (e.g. 'pet_breed').\n"
-        )
+
+        system_prompt = self._config.llm_extraction_service_system_prompt
         if buffer_messages:
             system_prompt += "\nRecent conversation:\n" + "\n".join([f"{m['role']}: {m['content']}" for m in buffer_messages])
         if candidate_facts:
             system_prompt += "\nExisting candidate facts:\n" + "\n".join([f"- {f.text}" for f in candidate_facts])
 
         user_prompt = f"Extract facts from this turn:\n{record.actor_role}: {record.content}"
-        
-        response = self._llm.structured_completion(system_prompt, user_prompt, ExtractionResponse)
+
+        response = self._llm.structured_completion(
+            system_prompt, user_prompt, ExtractionResponse,
+            temperature=self._config.llm_temperature, max_tokens=self._config.extractor_max_tokens,
+            timeout=self._config.extractor_timeout_seconds,
+            max_retries=self._config.llm_structured_retry_attempts,
+        )
         
         drafts = []
         for d in response.drafts:

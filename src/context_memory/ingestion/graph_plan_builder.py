@@ -7,15 +7,18 @@ between them — one `Chunk` + its accepted `ExtractedMemoryCandidate`s become
 `Session`/`Turn`/`Fact`/`Entity`/`Alias` nodes and `HAS_TURN`/`EXTRACTED_FROM`/
 `ABOUT`/`HAS_ALIAS` edges (labels/types from `core/graph.py`, already approved).
 
-Deliberately does not emit `SUPERSEDES`. `TemporalUpdateClassifier.classify`
-(ADR-020) requires a `FactState.predicate_key` to gate same-subject/same-
-predicate before it will even consider calling the model — and nothing in the
-current deterministic extraction baseline (ADR-019) produces a predicate for a
-candidate; `ExtractedMemoryCandidate`/`ExtractionDraft` carry free text only.
-Inventing a predicate heuristic here would be extraction-quality work smuggled
-into graph-plan construction. This is a real, open gap (see ADR-030), not an
-oversight: a future extractor milestone needs to produce `predicate_key`
-before any fact can supersede another in the graph.
+Emits `SUPERSEDES` when the caller supplies both `update_classifier` and
+`find_existing_facts` (optional constructor-time/call-time args) — closing
+the gap ADR-030 originally left open once `ExtractedMemoryCandidate` gained
+`action`/`predicate_key` fields. Still not wired to a real data source in
+production: no caller currently constructs a real `find_existing_facts`
+(query "active facts for this subject+predicate"), only test fakes do, so
+the mechanism is code-complete but inert until one exists.
+
+Every node also carries its `logical_key` as an actual graph property (not
+just the Python-side manifest/registry bookkeeping field) — `retrieval.py`'s
+graph expansion and `hydration.py`'s entity hydration both `MATCH`/`RETURN`
+on `logical_key`, so it has to actually be written, not just computed.
 
 An unresolved entity mention (`EntityResolution.entity is None`) is skipped,
 never forced into an `ABOUT` edge — the same guarantee ADR-020 already makes
@@ -137,10 +140,12 @@ class GraphPlanBuilder:
                         relationships[supersedes_edge.graph_id] = supersedes_edge
                         
                         # Update old fact
+                        prior_logical_key = f"fact:{prior_fact.fact_id}"
                         nodes[prior_fact_graph_id] = GraphNode(
-                            prior_fact_graph_id, "Fact", f"fact:{prior_fact.fact_id}",
+                            prior_fact_graph_id, "Fact", prior_logical_key,
                             _scalar_properties(
                                 context_id,
+                                logical_key=prior_logical_key,
                                 is_current=False,
                                 superseded_at=int(decision.prior_superseded_at.timestamp()) if decision.prior_superseded_at else 9999999999,
                                 valid_to=int(decision.prior_valid_to.timestamp()) if decision.prior_valid_to else 9999999999
@@ -156,26 +161,24 @@ class GraphPlanBuilder:
         )
 
     def _session_node(self, chunk: Chunk) -> GraphNode:
+        """A session's node identity is stable across every turn in it (same
+        graph_id, same logical_key) — its properties must be too, or the second
+        turn's write conflicts with the first's in `PostgresGraphManifestStore`
+        (same logical key, different payload, rejected by design). Earlier this
+        derived `date`/`date_epoch`/`turn_count`/`source_index` from *the current
+        chunk*, which differs turn to turn — confirmed empirically: any session
+        with more than one turn failed ingestion on its second turn. Session-level
+        aggregates like turn count belong to a graph traversal (`count()` over
+        `HAS_TURN`) or a query-time computation, not a value baked into the node
+        at an arbitrary turn's write time.
+        """
         session_key = chunk.session_id or "unknown"
         logical_key = f"session:{session_key}"
         graph_id = self._allocator.allocate_graph_id("session", chunk.context_id, logical_key)
-        
-        # Calculate properties
-        dt = chunk.occurred_at
-        date_str = dt.strftime("%Y-%m-%d")
-        date_epoch = int(dt.timestamp())
-        
-        metadata = chunk.metadata or {}
-        turn_count = metadata.get("turn_count", 0)
-        source_index = metadata.get("source_index", 0)
-        
         properties = _scalar_properties(
             chunk.context_id,
+            logical_key=logical_key,
             session_id=session_key,
-            date=date_str,
-            date_epoch=date_epoch,
-            turn_count=turn_count,
-            source_index=source_index
         )
         return GraphNode(graph_id, "Session", logical_key, properties)
 
@@ -186,6 +189,7 @@ class GraphPlanBuilder:
         
         properties = _scalar_properties(
             chunk.context_id,
+            logical_key=logical_key,
             chunk_id=chunk.chunk_id,
             content_hash=chunk.content_hash,
             source_record_id=chunk.source_record_id,
@@ -213,7 +217,7 @@ class GraphPlanBuilder:
         graph_id = self._allocator.allocate_graph_id("entity", chunk.context_id, logical_key)
         return GraphNode(
             graph_id, "Entity", logical_key,
-            _scalar_properties(chunk.context_id, canonical_name=role, entity_type="speaker"),
+            _scalar_properties(chunk.context_id, logical_key=logical_key, canonical_name=role, entity_type="speaker"),
         )
 
     def _stated_by_edge(
@@ -237,6 +241,7 @@ class GraphPlanBuilder:
         
         properties = _scalar_properties(
             chunk.context_id,
+            logical_key=logical_key,
             text=candidate.text,
             speaker=chunk.actor_role,
             session_id=chunk.session_id or "unknown",
@@ -271,7 +276,7 @@ class GraphPlanBuilder:
         logical_key = f"entity:{profile.canonical_name}"
         return GraphNode(
             profile.graph_id, "Entity", logical_key,
-            _scalar_properties(profile.context_id, canonical_name=profile.canonical_name, entity_type=profile.entity_type),
+            _scalar_properties(profile.context_id, logical_key=logical_key, canonical_name=profile.canonical_name, entity_type=profile.entity_type),
         )
 
     def _about_edge(
@@ -291,7 +296,7 @@ class GraphPlanBuilder:
             alias_graph_id = self._allocator.allocate_graph_id("alias", profile.context_id, alias_logical_key)
             alias_node = GraphNode(
                 alias_graph_id, "Alias", alias_logical_key,
-                _scalar_properties(profile.context_id, canonical_alias=alias, entity_graph_id=profile.graph_id),
+                _scalar_properties(profile.context_id, logical_key=alias_logical_key, canonical_alias=alias, entity_graph_id=profile.graph_id),
             )
             edge_logical_key = f"has_alias:{profile.graph_id}:{alias}"
             edge_graph_id = self._allocator.allocate_graph_id("has_alias", profile.context_id, edge_logical_key)

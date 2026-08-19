@@ -90,7 +90,7 @@ from context_memory.ingestion.extraction import LLMExtractionService, Extraction
 class FakeLLMClient:
     def __init__(self, response):
         self.response = response
-    def structured_completion(self, system, user, schema):
+    def structured_completion(self, system, user, schema, **kwargs):
         return self.response
 
 class FakeContextRepo:

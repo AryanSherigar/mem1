@@ -8,14 +8,14 @@ from pydantic import BaseModel
 
 from context_memory.engine import MemoryEngine
 from context_memory.client.hydradb_http import HydraHttpTransport
-from context_memory.core.llm_client import LLMClient
+from context_memory.core.config import Config
 from context_memory.ingestion.embedding import SentenceTransformerEmbedder
 from context_memory.ingestion.extraction import ExtractionService
 from context_memory.ingestion.graph_plan_builder import GraphPlanBuilder
 from context_memory.ingestion.graph_writer import GraphWriter
-from context_memory.ingestion.model_adapters import LLMExtractor
+from context_memory.ingestion.model_adapters import LLMEntityResolutionModel, LLMExtractor, LLMTemporalUpdateModel
 from context_memory.ingestion.orchestrator import IngestionOrchestrator
-from context_memory.ingestion.resolution import EntityRegistry
+from context_memory.ingestion.resolution import EntityRegistry, TemporalUpdateClassifier
 from context_memory.persistence.postgres import (
     PostgresChunkStore,
     PostgresEmbeddingStore,
@@ -31,33 +31,35 @@ _GLOBAL_ENGINE: MemoryEngine | None = None
 
 
 def get_engine() -> MemoryEngine:
+    """Every tunable value here comes from one `Config` instance — see
+    `core/config.py`. This function only wires objects together; it does not
+    read `os.environ` itself."""
     global _GLOBAL_ENGINE
     if _GLOBAL_ENGINE is not None:
         return _GLOBAL_ENGINE
 
-    db_url = os.environ.get("CONTEXT_MEMORY_DATABASE_URL", os.environ.get("DATABASE_URL", "postgresql://context_memory@127.0.0.1:54329/context_memory"))
-    hydra_url = os.environ.get("CONTEXT_MEMORY_HYDRADB_URL", os.environ.get("HYDRA_DB_HOST", "http://127.0.0.1:8080"))
+    config = Config()
+
+    hydra_url = config.hydradb_url
     if not hydra_url.startswith("http://") and not hydra_url.startswith("https://"):
         hydra_url = f"http://{hydra_url}"
-    hydra_token = os.environ.get("CONTEXT_MEMORY_HYDRADB_TOKEN", os.environ.get("HYDRA_DB_API_KEY", "context-memory-local-smoke-token-32b"))
-    hydra_db = os.environ.get("CONTEXT_MEMORY_HYDRADB_DATABASE", os.environ.get("HYDRA_DB_GRAPH_ID", "default"))
-
-    llm_base_url = os.environ.get("FIREWORKS_BASE_URL", os.environ.get("OPENAI_BASE_URL", "https://api.fireworks.ai/inference/v1"))
-    llm_api_key = os.environ.get("FIREWORKS_API_KEY", os.environ.get("OPENAI_API_KEY", "fake-key"))
-    llm_model = os.environ.get("EXTRACTOR_MODEL", "accounts/fireworks/models/deepseek-v4-flash-0731")
 
     import psycopg
     from pathlib import Path
     from context_memory.persistence.migrations import apply_migrations
 
-    pg_conn = psycopg.connect(db_url, autocommit=True)
+    pg_conn = psycopg.connect(config.database_url, autocommit=True)
     migrations_dir = Path(__file__).resolve().parents[2] / "db" / "migrations"
     if migrations_dir.exists():
         apply_migrations(pg_conn, migrations_dir)
 
-    hydra_transport = HydraHttpTransport(base_url=hydra_url, bearer_token=hydra_token or None, database=hydra_db)
-    llm_client = LLMClient(base_url=llm_base_url, api_key=llm_api_key, model_name=llm_model)
-    embedder = SentenceTransformerEmbedder()
+    hydra_transport = HydraHttpTransport(
+        base_url=hydra_url,
+        bearer_token=config.hydradb_token or None,
+        database=config.hydradb_database,
+        timeout_seconds=config.hydradb_request_timeout_seconds,
+    )
+    embedder = SentenceTransformerEmbedder(model_name=config.embedding_model_name)
 
     chunk_store = PostgresChunkStore(pg_conn)
     job_store = PostgresJobStore(pg_conn)
@@ -66,15 +68,14 @@ def get_engine() -> MemoryEngine:
     search_index_store = PostgresSearchIndexStore(pg_conn)
     extraction_store = PostgresExtractionStore(pg_conn)
 
-    extractor = LLMExtractor(llm_client)
+    extractor = LLMExtractor(config.get_extractor_client(), config)
     extraction_service = ExtractionService(extractor, extraction_store)
-    entity_registry = EntityRegistry(allocator=chunk_store, model=None)
+    entity_resolution_model = LLMEntityResolutionModel(config.get_entity_resolution_client(), config)
+    entity_registry = EntityRegistry(allocator=chunk_store, model=entity_resolution_model)
     plan_builder = GraphPlanBuilder(allocator=chunk_store)
     graph_writer = GraphWriter(manifest_store=manifest_store, transport=hydra_transport)
 
-    from context_memory.ingestion.model_adapters import LLMTemporalUpdateModel
-    from context_memory.ingestion.resolution import TemporalUpdateClassifier
-    temporal_model = LLMTemporalUpdateModel(llm_client)
+    temporal_model = LLMTemporalUpdateModel(config.get_temporal_update_client(), config)
     update_classifier = TemporalUpdateClassifier(temporal_model)
 
     orchestrator = IngestionOrchestrator(
@@ -91,10 +92,13 @@ def get_engine() -> MemoryEngine:
     )
 
     retrieval_engine = HybridRetrievalEngine(
-        llm_client=llm_client,
+        llm_client=config.get_reader_client(),
         embedder=embedder,
         pg_connection=pg_conn,
         hydra_client=hydra_transport,
+        config=config,
+        temporal_resolver_client=config.get_temporal_resolver_client(),
+        query_rewriter_client=config.get_query_rewriter_client(),
     )
 
     hydration_manager = HydrationManager(
@@ -106,9 +110,10 @@ def get_engine() -> MemoryEngine:
     _GLOBAL_ENGINE = MemoryEngine(
         orchestrator=orchestrator,
         retrieval_engine=retrieval_engine,
-        llm_client=llm_client,
+        llm_client=config.get_reader_client(),
         pg_connection=pg_conn,
         hydration_manager=hydration_manager,
+        config=config,
     )
     return _GLOBAL_ENGINE
 

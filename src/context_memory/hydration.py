@@ -37,8 +37,8 @@ class HydrationManager:
         with self._pg.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT subject_id, values 
-                FROM memory_embeddings 
+                SELECT subject_id, embedding
+                FROM memory_embeddings
                 WHERE context_id = %s AND subject_kind = 'fact' AND is_active = true
                 """,
                 (context_id,)

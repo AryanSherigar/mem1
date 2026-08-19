@@ -1,11 +1,8 @@
-"""Environment-driven configuration for the M5/M7 provider-neutral adapters (ADR-027).
-
-Deliberately narrow: only the two bounded-LLM roles (`ingestion.ports.
-EntityResolutionModel`, `TemporalUpdateModel`) and the embedding model. Graph
-transport configuration (`CONTEXT_MEMORY_HYDRADB_URL`/`_TOKEN`) and the SQL
-connection string stay where they already are, read directly at call sites
-(`tests/test_hydradb_live.py`, `tests/test_postgres_persistence.py`) — this
-module does not centralize them, to avoid moving working, tested behavior.
+"""Single source of truth for every tunable value in the system: model
+allocation per role, LLM call limits, retrieval scoring/thresholds, ingestion
+concurrency, and every system prompt. Nothing below is read from `os.environ`
+anywhere else in the codebase — if a value needs to be dialed, it's a field
+here, not a literal buried in `retrieval.py`/`model_adapters.py`/`engine.py`.
 
 Deliberately does NOT auto-load `.env` on import. `main` branch's version of
 this module did (`load_dotenv()` at module scope) — that is an import-time
@@ -26,57 +23,315 @@ from dataclasses import dataclass, field
 
 from context_memory.core.llm_client import LLMClient
 
+# Default provider. Groq, measured against Fireworks on this exact workload:
+# ~0.95s warm per extraction call vs 0.8s, but Fireworks' `deepseek-v4-flash`
+# cold-started at 226s for an 11-token prompt, and — decisively — returned
+# EMPTY content whenever its completion budget was exhausted by hidden
+# reasoning (`finish_reason=length`, `content=''`), which is a systematic
+# defect of that model, not an occasional blip. Groq's gpt-oss-120b returned
+# valid JSON on the first attempt every time. Any OpenAI-compatible endpoint
+# still works — set LLM_BASE_URL/LLM_API_KEY/LLM_MODEL (or the per-role
+# overrides below) to point anywhere.
+_DEFAULT_BASE_URL = "https://api.groq.com/openai/v1"
+# qwen3.6-27b is the one model on this endpoint that accepts
+# `reasoning_effort="none"` — genuinely no hidden reasoning. Measured against
+# gpt-oss-120b on the same extraction prompt: 0.17s vs 0.50-0.76s, and 36
+# completion tokens vs 160-330 (the rest being reasoning the caller never sees
+# but pays for in both latency and budget). It also fixes a correctness bug,
+# not just speed: the same call WITHOUT reasoning disabled returns HTTP 400
+# "Failed to validate JSON" because reasoning text corrupts the JSON body.
+# gpt-oss models only accept low/medium/high, so reasoning cannot be turned off
+# there at all — which is what produced the empty-content-at-budget-exhaustion
+# failures seen on both Fireworks' deepseek and Groq's gpt-oss.
+_DEFAULT_MODEL = "qwen/qwen3.6-27b"
+
+
+def _role_base_url(env_name: str) -> str:
+    """Per-role override, else generic LLM_BASE_URL, else the legacy
+    FIREWORKS_BASE_URL (kept so existing .env files keep working), else default."""
+    return os.getenv(
+        env_name,
+        os.getenv("LLM_BASE_URL", os.getenv("FIREWORKS_BASE_URL", _DEFAULT_BASE_URL)),
+    )
+
+
+def _role_api_key(env_name: str) -> str:
+    return os.getenv(
+        env_name,
+        os.getenv("LLM_API_KEY", os.getenv("GROQ_API_KEY", os.getenv("FIREWORKS_API_KEY", ""))),
+    )
+
+
+def _role_model(env_name: str) -> str:
+    return os.getenv(env_name, os.getenv("LLM_MODEL", _DEFAULT_MODEL))
+
+
+# ---------------------------------------------------------------------------
+# Prompts. Every system prompt used anywhere in the pipeline lives here, not
+# as a module-level constant next to the code that calls it.
+# ---------------------------------------------------------------------------
+
+ENTITY_RESOLUTION_SYSTEM_PROMPT = (
+    "You resolve an entity surface form (a name, nickname, or pronoun-adjacent mention) to "
+    "exactly one of a fixed, already-bounded candidate list, or to none if no candidate is "
+    "the same real-world entity. Treat aliases and partial names (e.g. a first name matching "
+    "a candidate's alias list) as potential matches, but never invent a candidate id that is "
+    "not in the supplied list. When two candidates are both plausible, or no candidate is a "
+    "confident match, prefer 'null' over a low-confidence guess — a missed link is cheaper "
+    "than a wrong merge."
+)
+
+TEMPORAL_UPDATE_SYSTEM_PROMPT = (
+    "You classify how a new fact relates to a prior fact about the same subject and "
+    "predicate, observed later in time. 'correction' means the prior fact was wrong "
+    "and is being fixed (e.g. 'my dog's name is Max, not Mac'); the real-world state "
+    "never changed. 'state_change' means the real world changed and the prior fact was "
+    "true until now (e.g. 'I moved to Seattle' after a prior 'I live in Austin'). "
+    "'no_update' means the new fact does not actually supersede the prior one — they can "
+    "both stay true (e.g. two different pets, not a renaming of the same one). Use "
+    "'unresolved' only if the text truly gives no clear basis to decide; do not default "
+    "to it just because the distinction is subtle."
+)
+
+FACT_EXTRACTION_SYSTEM_PROMPT = (
+    "You are a long-term memory extraction assistant. Extract atomic, enduring facts about the user "
+    "or assistant from the dialogue turn. Ignore trivial chitchat, transient pleasantries, greetings, "
+    "and anything true only for the duration of this conversation. Each fact must stand alone without "
+    "needing the rest of the dialogue to be understood — resolve pronouns to the entity they refer to. "
+    "Split compound statements into separate atomic facts rather than one merged sentence. "
+    "For each extracted fact, provide:\n"
+    "- text: The concise, self-contained atomic factual assertion.\n"
+    "- action: 'ADD' for new facts, 'UPDATE' if updating an existing attribute, 'DELETE' if invalidating a past fact.\n"
+    "- predicate_key: A clean snake_case predicate category (e.g. 'pet_name', 'favorite_food', 'location', 'hobby').\n"
+    "- entities: List of specific named entities mentioned in the fact (e.g. ['Max', 'Seattle']).\n"
+    "- confidence: Confidence score between 0.0 and 1.0 — reserve above 0.9 for facts stated as plain "
+    "assertions, and below 0.6 for hedged, sarcastic, or implied statements.\n"
+    "- exact_quote: The exact substring in the input text that provides direct evidence for this fact.\n"
+    "If the turn contains no durable facts, return an empty facts list rather than forcing one. "
+    "Respond with the JSON object only — no reasoning, preamble, or commentary before it."
+)
+
+# {question_date} is substituted at call time (current reference time for the question).
+TEMPORAL_RESOLVER_SYSTEM_PROMPT_TEMPLATE = (
+    "You are a temporal query resolver. Current reference time is {question_date} (UTC). "
+    "Analyze the question and extract the world-validity time range [valid_from, valid_to] "
+    "only if it references a specific time, explicitly (a date) or relatively (e.g. 'yesterday', "
+    "'last month', 'this summer') — resolve relative expressions against the current reference "
+    "time above. If the question has no temporal anchor at all, return null for both rather than "
+    "guessing a range."
+)
+
+QUERY_REWRITER_SYSTEM_PROMPT = (
+    "You are a query expansion assistant for a fact-retrieval system. Decompose complex or "
+    "multi-part questions into atomic sub-questions, one per distinct piece of information "
+    "needed — leave simple, already-atomic questions as a single item rather than splitting "
+    "for its own sake. Extract a short list of key entity/predicate synonyms (e.g. 'dog' -> "
+    "'pet', 'puppy') to maximize keyword recall; skip synonyms for terms that are already "
+    "unambiguous. Prefer fewer, higher-value items over an exhaustive list."
+)
+
+# {context} is substituted at call time (the assembled, ranked evidence block).
+READER_SYSTEM_PROMPT_TEMPLATE = (
+    "You are a memory-grounded assistant. Answer the user's question using only the facts "
+    "in the memory context below — do not use outside knowledge or assumptions beyond what "
+    "is stated. Each fact is timestamped; if facts conflict, trust the most recent one. If "
+    "the context does not contain enough information to answer, say so plainly instead of "
+    "guessing. Answer directly and concisely, in a natural conversational tone — do not "
+    "restate the context verbatim or mention that you were given a context.\n\n"
+    "Memory context:\n{context}"
+)
+
+# Base prompt for the alternate context-aware extractor (`LLMExtractionService`,
+# `ingestion/extraction.py`). Recent-turns/candidate-facts context is appended
+# by the caller at call time — that's assembled content, not a tunable, so it
+# stays inline there.
+LLM_EXTRACTION_SERVICE_SYSTEM_PROMPT = (
+    "You are an expert extraction AI. Extract atomic facts from the current turn, each one "
+    "understandable without the rest of the conversation.\n"
+    "Identify the appropriate action (ADD, UPDATE, DELETE) — use UPDATE/DELETE only when the "
+    "turn clearly changes or invalidates one of the existing candidate facts listed below.\n"
+    "If updating an existing state or property, specify a predicate_key (e.g. 'pet_breed').\n"
+    "Respond with the JSON object only — no reasoning or commentary before it.\n"
+)
+
 
 @dataclass(frozen=True)
 class Config:
-    """Model allocation for the bounded entity-resolution and temporal-update ports."""
+    # -- Ingestion/resolution roles (ADR-027/029) --------------------------
+    entity_resolution_base_url: str = field(default_factory=lambda: _role_base_url("ENTITY_RESOLUTION_BASE_URL"))
+    entity_resolution_api_key: str = field(default_factory=lambda: _role_api_key("ENTITY_RESOLUTION_API_KEY"))
+    entity_resolution_model: str = field(default_factory=lambda: _role_model("ENTITY_RESOLUTION_MODEL"))
 
-    # Default provider/model: Fireworks + deepseek-v4-flash. Both roles fall back to
-    # the shared FIREWORKS_API_KEY when a role-specific key isn't set, so one key in
-    # .env is enough; set the role-specific vars only to split roles across models.
-    entity_resolution_base_url: str = field(
-        default_factory=lambda: os.getenv("ENTITY_RESOLUTION_BASE_URL", "https://api.fireworks.ai/inference/v1")
-    )
-    entity_resolution_api_key: str = field(
-        default_factory=lambda: os.getenv("ENTITY_RESOLUTION_API_KEY", os.getenv("FIREWORKS_API_KEY", ""))
-    )
-    entity_resolution_model: str = field(
-        default_factory=lambda: os.getenv(
-            "ENTITY_RESOLUTION_MODEL", "accounts/fireworks/models/deepseek-v4-flash-0731"
-        )
-    )
+    temporal_update_base_url: str = field(default_factory=lambda: _role_base_url("TEMPORAL_UPDATE_BASE_URL"))
+    temporal_update_api_key: str = field(default_factory=lambda: _role_api_key("TEMPORAL_UPDATE_API_KEY"))
+    temporal_update_model: str = field(default_factory=lambda: _role_model("TEMPORAL_UPDATE_MODEL"))
 
-    temporal_update_base_url: str = field(
-        default_factory=lambda: os.getenv("TEMPORAL_UPDATE_BASE_URL", "https://api.fireworks.ai/inference/v1")
-    )
-    temporal_update_api_key: str = field(
-        default_factory=lambda: os.getenv("TEMPORAL_UPDATE_API_KEY", os.getenv("FIREWORKS_API_KEY", ""))
-    )
-    temporal_update_model: str = field(
-        default_factory=lambda: os.getenv(
-            "TEMPORAL_UPDATE_MODEL", "accounts/fireworks/models/deepseek-v4-flash-0731"
-        )
-    )
+    extractor_base_url: str = field(default_factory=lambda: _role_base_url("EXTRACTOR_BASE_URL"))
+    extractor_api_key: str = field(default_factory=lambda: _role_api_key("EXTRACTOR_API_KEY"))
+    extractor_model: str = field(default_factory=lambda: _role_model("EXTRACTOR_MODEL"))
 
+    # -- Retrieval roles ------------------------------------------------
+    reader_base_url: str = field(default_factory=lambda: _role_base_url("READER_BASE_URL"))
+    reader_api_key: str = field(default_factory=lambda: _role_api_key("READER_API_KEY"))
+    reader_model: str = field(default_factory=lambda: _role_model("READER_MODEL"))
+
+    temporal_resolver_base_url: str = field(default_factory=lambda: _role_base_url("TEMPORAL_RESOLVER_BASE_URL"))
+    temporal_resolver_api_key: str = field(default_factory=lambda: _role_api_key("TEMPORAL_RESOLVER_API_KEY"))
+    temporal_resolver_model: str = field(default_factory=lambda: _role_model("TEMPORAL_RESOLVER_MODEL"))
+
+    query_rewriter_base_url: str = field(default_factory=lambda: _role_base_url("QUERY_REWRITER_BASE_URL"))
+    query_rewriter_api_key: str = field(default_factory=lambda: _role_api_key("QUERY_REWRITER_API_KEY"))
+    query_rewriter_model: str = field(default_factory=lambda: _role_model("QUERY_REWRITER_MODEL"))
+
+    # -- LLM call limits, sized per role ------------------------------------
+    # A 241-second call that returned an empty completion (hit its own output
+    # ceiling before producing valid JSON) is what an unbounded call actually
+    # does — confirmed live, not a theoretical risk. Every role gets a cap.
+    # One shared cap isn't right either: extraction reasons over a whole turn
+    # before emitting JSON and was the one role that hit 2048 and came back
+    # empty (confirmed live), while classification/selection roles emit a few
+    # words of JSON and gain nothing from a large ceiling but pay for one in
+    # provider-side worst-case latency. Every role below is sized to its own
+    # output shape rather than sharing one number.
+    llm_temperature: float = field(default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.0")))
+    # Confirmed live (LongMemEval pilot): a reasoning model can spend its whole
+    # completion budget on hidden reasoning and return empty content — the cap
+    # bounds worst-case latency but doesn't prevent this. One retry (with a
+    # blunter prompt and, only on a genuine budget-exhaustion `finish_reason`,
+    # a doubled budget) recovers most of these instead of silently losing a
+    # turn's facts. See `LLMClient.structured_completion`.
+    llm_structured_retry_attempts: int = field(default_factory=lambda: int(os.getenv("LLM_STRUCTURED_RETRY_ATTEMPTS", "1")))
+    # The OpenAI SDK's own retry count. Its default of 2 multiplies every timeout
+    # (45s cap became 135s of real wall clock — measured). Kept at 1 rather than 0
+    # because Groq rate-limits on tokens-per-minute and a 429 deserves one retry.
+    llm_sdk_max_retries: int = field(default_factory=lambda: int(os.getenv("LLM_SDK_MAX_RETRIES", "1")))
+    # Sent only when non-empty, because valid values are model-specific
+    # (qwen3.6: none|default — gpt-oss: low|medium|high) and an unsupported
+    # value is a hard 400. Empty string omits the parameter entirely, which is
+    # the right behavior for any provider/model that doesn't know it.
+    llm_reasoning_effort: str = field(default_factory=lambda: os.getenv("LLM_REASONING_EFFORT", "none"))
+
+    entity_resolution_max_tokens: int = field(default_factory=lambda: int(os.getenv("ENTITY_RESOLUTION_MAX_TOKENS", "512")))
+    entity_resolution_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("ENTITY_RESOLUTION_TIMEOUT_SECONDS", "20")))
+
+    temporal_update_max_tokens: int = field(default_factory=lambda: int(os.getenv("TEMPORAL_UPDATE_MAX_TOKENS", "512")))
+    temporal_update_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("TEMPORAL_UPDATE_TIMEOUT_SECONDS", "20")))
+
+    # Extraction reasons over the whole turn before emitting JSON — this is the
+    # role that actually hit the old 2048 shared cap and came back empty/truncated
+    # (confirmed live). Given more headroom and more time to use it.
+    extractor_max_tokens: int = field(default_factory=lambda: int(os.getenv("EXTRACTOR_MAX_TOKENS", "4096")))
+    extractor_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("EXTRACTOR_TIMEOUT_SECONDS", "45")))
+
+    # Reader writes a full prose answer, so gets more room than a structured-json
+    # role, and a bit of warmth (0.0 elsewhere is deliberate for determinism on
+    # classification/extraction; a synthesized answer reads better slightly above
+    # frozen-greedy without materially risking groundedness given the prompt's
+    # context-only instruction).
+    reader_temperature: float = field(default_factory=lambda: float(os.getenv("READER_TEMPERATURE", "0.2")))
+    reader_max_tokens: int = field(default_factory=lambda: int(os.getenv("READER_MAX_TOKENS", "1536")))
+    reader_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("READER_TIMEOUT_SECONDS", "25")))
+
+    temporal_resolver_max_tokens: int = field(default_factory=lambda: int(os.getenv("TEMPORAL_RESOLVER_MAX_TOKENS", "512")))
+    temporal_resolver_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("TEMPORAL_RESOLVER_TIMEOUT_SECONDS", "15")))
+
+    query_rewriter_max_tokens: int = field(default_factory=lambda: int(os.getenv("QUERY_REWRITER_MAX_TOKENS", "768")))
+    query_rewriter_timeout_seconds: float = field(default_factory=lambda: float(os.getenv("QUERY_REWRITER_TIMEOUT_SECONDS", "15")))
+
+    # -- Embedding (Milestone 7) ------------------------------------------
     embedding_model_name: str = field(
         default_factory=lambda: os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
     )
-    embedding_model_version: str = field(
-        default_factory=lambda: os.getenv("EMBEDDING_MODEL_VERSION", "1")
+    embedding_model_version: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL_VERSION", "1"))
+
+    # -- Retrieval tuning (FINAL_ARCHITECTURE.md §12) ----------------------
+    retrieval_top_k: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_TOP_K", "15")))
+    retrieval_overfetch_multiplier: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_OVERFETCH_MULTIPLIER", "4")))
+    retrieval_overfetch_floor: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_OVERFETCH_FLOOR", "60")))
+    retrieval_chat_ttl_hours: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_CHAT_TTL_HOURS", "24")))
+    retrieval_temporal_buffer_days: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_TEMPORAL_BUFFER_DAYS", "2")))
+    # Session-[:HAS_TURN]->Turn-[:EXTRACTED_FROM]->Fact-[:ABOUT]->Entity is the
+    # deepest real path in the schema; MSpaths hops fact-to-fact via a shared
+    # Entity. 4 hops routinely walks past directly-relevant facts into
+    # loosely-associated ones, and each hop is a real per-fact HydraDB round
+    # trip (no batched UNWIND reads — see retrieval.py), so it's a latency cost
+    # for mostly-noise recall. 3 still reaches one shared-entity hop past the
+    # seed set.
+    retrieval_graph_max_hops: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_GRAPH_MAX_HOPS", "3")))
+    retrieval_structural_path_cap: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_STRUCTURAL_PATH_CAP", "3")))
+    retrieval_entity_boost_cap: float = field(default_factory=lambda: float(os.getenv("RETRIEVAL_ENTITY_BOOST_CAP", "0.5")))
+    # Cosmetic normalizer only: composite_score is a monotonic sum divided by a
+    # constant, so it never changes ranking order, only the reported number's
+    # scale. 3.5 matches the true max of the sum it divides (semantic<=1 +
+    # keyword<=1 + structural<=1 + entity_boost<=0.5) so a maxed-out fact reads
+    # as ~1.0 instead of ~1.17.
+    retrieval_composite_score_divisor: float = field(default_factory=lambda: float(os.getenv("RETRIEVAL_COMPOSITE_SCORE_DIVISOR", "3.5")))
+    retrieval_abstention_semantic_threshold: float = field(
+        default_factory=lambda: float(os.getenv("RETRIEVAL_ABSTENTION_SEMANTIC_THRESHOLD", "0.3"))
+    )
+    retrieval_abstention_message: str = field(
+        default_factory=lambda: os.getenv("RETRIEVAL_ABSTENTION_MESSAGE", "I don't have that information in my memory.")
     )
 
-    def get_entity_resolution_client(self) -> LLMClient:
-        """LLMClient for `LLMEntityResolutionModel`. Requires a real API key to call."""
+    # -- Ingestion concurrency ---------------------------------------------
+    ingestion_executor_max_workers: int = field(default_factory=lambda: int(os.getenv("INGESTION_EXECUTOR_MAX_WORKERS", "1")))
+
+    # -- Storage / transport connection settings ---------------------------
+    database_url: str = field(
+        default_factory=lambda: os.getenv(
+            "CONTEXT_MEMORY_DATABASE_URL",
+            os.getenv("DATABASE_URL", "postgresql://context_memory@127.0.0.1:54329/context_memory"),
+        )
+    )
+    hydradb_url: str = field(
+        default_factory=lambda: os.getenv(
+            "CONTEXT_MEMORY_HYDRADB_URL", os.getenv("HYDRA_DB_HOST", "http://127.0.0.1:8080")
+        )
+    )
+    hydradb_token: str = field(
+        default_factory=lambda: os.getenv(
+            "CONTEXT_MEMORY_HYDRADB_TOKEN",
+            os.getenv("HYDRA_DB_API_KEY", "context-memory-local-smoke-token-32b"),
+        )
+    )
+    hydradb_database: str = field(
+        default_factory=lambda: os.getenv("CONTEXT_MEMORY_HYDRADB_DATABASE", os.getenv("HYDRA_DB_GRAPH_ID", "default"))
+    )
+    hydradb_request_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("HYDRADB_REQUEST_TIMEOUT_SECONDS", "15"))
+    )
+
+    # -- Prompts (module-level strings above; fields here so a caller can
+    #    override per-instance without editing source) ----------------------
+    entity_resolution_system_prompt: str = ENTITY_RESOLUTION_SYSTEM_PROMPT
+    temporal_update_system_prompt: str = TEMPORAL_UPDATE_SYSTEM_PROMPT
+    fact_extraction_system_prompt: str = FACT_EXTRACTION_SYSTEM_PROMPT
+    temporal_resolver_system_prompt_template: str = TEMPORAL_RESOLVER_SYSTEM_PROMPT_TEMPLATE
+    query_rewriter_system_prompt: str = QUERY_REWRITER_SYSTEM_PROMPT
+    reader_system_prompt_template: str = READER_SYSTEM_PROMPT_TEMPLATE
+    llm_extraction_service_system_prompt: str = LLM_EXTRACTION_SERVICE_SYSTEM_PROMPT
+
+    def _client(self, base_url: str, api_key: str, model: str) -> LLMClient:
         return LLMClient(
-            base_url=self.entity_resolution_base_url,
-            api_key=self.entity_resolution_api_key,
-            model_name=self.entity_resolution_model,
+            base_url=base_url, api_key=api_key, model_name=model,
+            sdk_max_retries=self.llm_sdk_max_retries,
+            reasoning_effort=self.llm_reasoning_effort,
         )
 
+    def get_entity_resolution_client(self) -> LLMClient:
+        return self._client(self.entity_resolution_base_url, self.entity_resolution_api_key, self.entity_resolution_model)
+
     def get_temporal_update_client(self) -> LLMClient:
-        """LLMClient for `LLMTemporalUpdateModel`. Requires a real API key to call."""
-        return LLMClient(
-            base_url=self.temporal_update_base_url,
-            api_key=self.temporal_update_api_key,
-            model_name=self.temporal_update_model,
-        )
+        return self._client(self.temporal_update_base_url, self.temporal_update_api_key, self.temporal_update_model)
+
+    def get_extractor_client(self) -> LLMClient:
+        return self._client(self.extractor_base_url, self.extractor_api_key, self.extractor_model)
+
+    def get_reader_client(self) -> LLMClient:
+        return self._client(self.reader_base_url, self.reader_api_key, self.reader_model)
+
+    def get_temporal_resolver_client(self) -> LLMClient:
+        return self._client(self.temporal_resolver_base_url, self.temporal_resolver_api_key, self.temporal_resolver_model)
+
+    def get_query_rewriter_client(self) -> LLMClient:
+        return self._client(self.query_rewriter_base_url, self.query_rewriter_api_key, self.query_rewriter_model)

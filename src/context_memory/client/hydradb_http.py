@@ -30,6 +30,7 @@ class HydraHttpTransport:
         graph_id: str = "default",
         database: str | None = None,
         cell_id: str = "cell-0",
+        timeout_seconds: float = 15.0,
         requester: HttpRequester | None = None,
     ) -> None:
         token = auth_token or bearer_token or "context-memory-local-smoke-token-32b"
@@ -38,7 +39,10 @@ class HydraHttpTransport:
             raise ValueError("base_url, auth token, namespace, graph_id, and cell_id must be non-empty")
         self._url = f"{base_url.rstrip('/')}/v1/graphs/{effective_graph_id}/query"
         self._headers = {"Authorization": f"Bearer {token}", "X-Graph-Namespace": namespace, "Content-Type": "application/json", "Accept": "application/json"}
-        self._cell_id, self._requester = cell_id, requester or _request_json
+        self._cell_id = cell_id
+        self._requester = requester or (
+            lambda method, url, headers, body: _request_json(method, url, headers, body, timeout=timeout_seconds)
+        )
 
     def write(self, cypher: str, rows: Sequence[dict[str, object]], idempotency_key: str) -> str | None:
         with timed_operation(logger, "hydradb.write", {"rows_count": len(rows), "idempotency_key": idempotency_key}) as ctx:
@@ -92,10 +96,10 @@ def _decode_value(value: object) -> object:
     raise HydraHttpError("HydraDB returned an unsupported query value")
 
 
-def _request_json(method: str, url: str, headers: Mapping[str, str], body: bytes) -> Mapping[str, object]:
+def _request_json(method: str, url: str, headers: Mapping[str, str], body: bytes, *, timeout: float = 15.0) -> Mapping[str, object]:
     request = Request(url, data=body, headers=dict(headers), method=method)
     try:
-        with urlopen(request, timeout=15) as response:  # noqa: S310 - caller configures a local endpoint
+        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - caller configures a local endpoint
             raw = response.read()
     except HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")[:500]

@@ -15,27 +15,12 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from context_memory.core.config import Config
 from context_memory.core.llm_client import LLMClient, LLMClientError
 from context_memory.core.logging import get_logger, timed_operation
 from context_memory.core.resolution import EntityProfile, FactState, TemporalRelation
 
 logger = get_logger(__name__)
-
-ENTITY_RESOLUTION_SYSTEM_PROMPT = (
-    "You resolve an entity surface form to exactly one of a fixed, already-bounded "
-    "candidate list, or to none if no candidate is the same real-world entity. "
-    "Never invent a candidate id that is not in the supplied list. Prefer 'null' over "
-    "a low-confidence guess."
-)
-
-TEMPORAL_UPDATE_SYSTEM_PROMPT = (
-    "You classify how a new fact relates to a prior fact about the same subject and "
-    "predicate, observed later in time. 'correction' means the prior fact was wrong "
-    "and is being fixed; the real-world state never changed. 'state_change' means the "
-    "real world changed and the prior fact was true until now. 'no_update' means the "
-    "new fact does not actually supersede the prior one. Use 'unresolved' if the text "
-    "gives no clear basis to decide."
-)
 
 
 class _EntityResolutionResponse(BaseModel):
@@ -60,8 +45,9 @@ def _format_candidates(candidates: Sequence[EntityProfile]) -> str:
 class LLMEntityResolutionModel:
     """`ingestion.ports.EntityResolutionModel` backed by a real LLM call."""
 
-    def __init__(self, client: LLMClient) -> None:
+    def __init__(self, client: LLMClient, config: Config | None = None) -> None:
         self._client = client
+        self._config = config or Config()
 
     def resolve_entity(
         self, *, context_id: str, surface: str, candidates: Sequence[EntityProfile]
@@ -76,7 +62,10 @@ class LLMEntityResolutionModel:
             )
             try:
                 result = self._client.structured_completion(
-                    ENTITY_RESOLUTION_SYSTEM_PROMPT, user_prompt, _EntityResolutionResponse
+                    self._config.entity_resolution_system_prompt, user_prompt, _EntityResolutionResponse,
+                    temperature=self._config.llm_temperature, max_tokens=self._config.entity_resolution_max_tokens,
+                    timeout=self._config.entity_resolution_timeout_seconds,
+                    max_retries=self._config.llm_structured_retry_attempts,
                 )
                 ctx["selected_id"] = result.selected_graph_id
                 return result.selected_graph_id
@@ -88,8 +77,9 @@ class LLMEntityResolutionModel:
 class LLMTemporalUpdateModel:
     """`ingestion.ports.TemporalUpdateModel` backed by a real LLM call."""
 
-    def __init__(self, client: LLMClient) -> None:
+    def __init__(self, client: LLMClient, config: Config | None = None) -> None:
         self._client = client
+        self._config = config or Config()
 
     def classify_update(self, *, new_fact: FactState, prior_fact: FactState) -> TemporalRelation:
         with timed_operation(logger, "temporal_update.classify", {"predicate": new_fact.predicate_key, "prior_id": prior_fact.fact_id, "new_id": new_fact.fact_id}) as ctx:
@@ -100,26 +90,16 @@ class LLMTemporalUpdateModel:
             )
             try:
                 result = self._client.structured_completion(
-                    TEMPORAL_UPDATE_SYSTEM_PROMPT, user_prompt, _TemporalUpdateResponse
+                    self._config.temporal_update_system_prompt, user_prompt, _TemporalUpdateResponse,
+                    temperature=self._config.llm_temperature, max_tokens=self._config.temporal_update_max_tokens,
+                    timeout=self._config.temporal_update_timeout_seconds,
+                    max_retries=self._config.llm_structured_retry_attempts,
                 )
                 ctx["classified_relation"] = result.relation
                 return TemporalRelation(result.relation)
             except LLMClientError as error:
                 logger.warning("Temporal update classification error: %s", error)
                 return TemporalRelation.UNRESOLVED
-
-
-FACT_EXTRACTION_SYSTEM_PROMPT = (
-    "You are a long-term memory extraction assistant. Extract atomic, enduring facts about the user "
-    "or assistant from the dialogue turn. Ignore trivial chitchat, transient pleasantries, and greetings. "
-    "For each extracted fact, provide:\n"
-    "- text: The concise, self-contained atomic factual assertion.\n"
-    "- action: 'ADD' for new facts, 'UPDATE' if updating an existing attribute, 'DELETE' if invalidating a past fact.\n"
-    "- predicate_key: A clean snake_case predicate category (e.g. 'pet_name', 'favorite_food', 'location', 'hobby').\n"
-    "- entities: List of specific named entities mentioned in the fact (e.g. ['Max', 'Seattle']).\n"
-    "- confidence: Confidence score between 0.0 and 1.0.\n"
-    "- exact_quote: The exact substring in the input text that provides direct evidence for this fact."
-)
 
 
 class _ExtractedFactItem(BaseModel):
@@ -141,8 +121,9 @@ class LLMExtractor:
     extractor_name = "llm-extractor"
     extractor_version = "v1"
 
-    def __init__(self, client: LLMClient) -> None:
+    def __init__(self, client: LLMClient, config: Config | None = None) -> None:
         self._client = client
+        self._config = config or Config()
 
     def extract(self, record: ContextRecord) -> Sequence[ExtractionDraft]:
         import uuid
@@ -157,7 +138,10 @@ class LLMExtractor:
             user_prompt = f"Speaker: {record.actor_role}\nContent: {content}\n\nExtract atomic facts:"
             try:
                 res = self._client.structured_completion(
-                    FACT_EXTRACTION_SYSTEM_PROMPT, user_prompt, _FactExtractionResponse
+                    self._config.fact_extraction_system_prompt, user_prompt, _FactExtractionResponse,
+                    temperature=self._config.llm_temperature, max_tokens=self._config.extractor_max_tokens,
+                    timeout=self._config.extractor_timeout_seconds,
+                    max_retries=self._config.llm_structured_retry_attempts,
                 )
             except Exception as e:
                 logger.error("LLMExtractor failed structured extraction for record %s: %s", record.record_id, e)

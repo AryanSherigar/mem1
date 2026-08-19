@@ -14,12 +14,12 @@ class FakeLLMClient:
         self.text_response = text_response
         self.structured_calls = 0
 
-    def structured_completion(self, system, user, schema):
+    def structured_completion(self, system, user, schema, **kwargs):
         resp = self.structured_responses[self.structured_calls]
         self.structured_calls += 1
         return resp
-        
-    def text_completion(self, system, user):
+
+    def text_completion(self, system, user, *args, **kwargs):
         return self.text_response
 
 class FakeEmbedder:
@@ -27,21 +27,39 @@ class FakeEmbedder:
         return (0.1, 0.2, 0.3)
 
 class FakeCursor:
-    def __init__(self, results):
-        self.results = results
-        self.idx = 0
+    """Recognizes which query it's answering by content, not call order — the
+    real query sequence changes as retrieval.py evolves (e.g. the graph_id_registry
+    lookup added to resolve HydraDB's id-only UNWIND matching), and a fixed
+    positional results list silently misaligns whenever that happens."""
+
+    def __init__(self, semantic_rows=(), bm25_rows=(), registry_rows=(), missing_text_rows=()):
+        self.semantic_rows = list(semantic_rows)
+        self.bm25_rows = list(bm25_rows)
+        self.registry_rows = list(registry_rows)
+        self.missing_text_rows = list(missing_text_rows)
+        self._last_query = ""
+
     def execute(self, query, params=None):
-        pass
+        self._last_query = query
+
     def fetchall(self):
-        res = self.results[self.idx]
-        self.idx += 1
-        return res
+        q = self._last_query
+        if "graph_id_registry" in q:
+            return self.registry_rows
+        if "memory_embeddings" in q:
+            return self.semantic_rows
+        if "ts_rank_cd" in q:
+            return self.bm25_rows
+        if "fact_search_index" in q:
+            return self.missing_text_rows
+        return []
+
     def __enter__(self): return self
     def __exit__(self, *args): pass
 
 class FakeConnection:
-    def __init__(self, results):
-        self.cursor_obj = FakeCursor(results)
+    def __init__(self, semantic_rows=(), bm25_rows=(), registry_rows=(), missing_text_rows=()):
+        self.cursor_obj = FakeCursor(semantic_rows, bm25_rows, registry_rows, missing_text_rows)
     def cursor(self):
         return self.cursor_obj
 
@@ -50,17 +68,18 @@ class FakeHydra:
         self.return_paths = return_paths
 
     def read(self, cypher, params, bookmark):
-        if "RETURN \n            f.logical_key" in cypher or "RETURN" in cypher and "valid_from" in cypher:
-            # First cypher query fetching nodes
+        # Per-fact calls now (retrieval.py stopped fighting HydraDB's UNWIND-read
+        # grammar and queries one fact at a time, see retrieval.py's own comment).
+        if "SUPERSEDES" in cypher:
+            return []
+        if "OPTIONAL MATCH" in cypher:
             return [{
-                "fact_key": key,
-                "valid_from": 0,
-                "valid_to": 9999999999,
-                "observed_at": 1000,
-                "superseded_at": 9999999999,
-                "entity_key": "entity-1"
-            } for key in params.get("fact_keys", [])]
-        elif "algo.MSpaths" in cypher:
+                "text": None, "speaker": None,
+                "valid_from": 0, "valid_to": 9999999999,
+                "observed_at": 1000, "superseded_at": 9999999999,
+                "memory_scope": None, "entity_key": "entity-1",
+            }]
+        if "algo.MSpaths" in cypher:
             if not self.return_paths:
                 return []
             return [{"path": [{"logical_key": "entity-1"}, {}, {"logical_key": "entity-2"}]}]
@@ -94,11 +113,13 @@ class TestRetrievalEngine(unittest.TestCase):
             QueryRewriterOutput(decomposed_queries=[], synonyms=[])
         ], text_response="Should not reach here")
         
-        # Return a fact with very low score
-        # 1st query: pgvector -> [('fact-1', 9.0)] -> semantic score = 1 / (1 + 9) = 0.1
-        # 2nd query: BM25 -> empty
-        # 3rd query: missing text -> [('fact-1', 'irrelevant')]
-        conn = FakeConnection([[("fact-1", 9.0)], [], [("fact-1", "irrelevant")]])
+        # pgvector -> [('fact-1', 9.0)] -> semantic score = 1 / (1 + 9) = 0.1; BM25 skipped
+        # (no rewriter keywords); registry resolves fact-1 -> graph_id 1; missing-text fallback.
+        conn = FakeConnection(
+            semantic_rows=[("fact-1", 9.0)],
+            registry_rows=[("fact:fact-1", 1)],
+            missing_text_rows=[("fact-1", "irrelevant")],
+        )
         
         engine = HybridRetrievalEngine(llm, FakeEmbedder(), conn, FakeHydra(return_paths=False))
         
@@ -111,10 +132,13 @@ class TestRetrievalEngine(unittest.TestCase):
             QueryRewriterOutput(decomposed_queries=[], synonyms=[])
         ], text_response="The dog is in the park")
         
-        # 1st query: pgvector -> [('fact-1', 0.1)] -> semantic score = 1 / 1.1 ≈ 0.9
-        # 2nd query: BM25 -> []
-        # 3rd query: missing text -> [('fact-1', 'dog in park')]
-        conn = FakeConnection([[("fact-1", 0.1)], [], [("fact-1", "dog in park")]])
+        # pgvector -> [('fact-1', 0.1)] -> semantic score = 1 / 1.1 ~= 0.9; BM25 skipped;
+        # registry resolves fact-1 -> graph_id 1; missing-text fallback.
+        conn = FakeConnection(
+            semantic_rows=[("fact-1", 0.1)],
+            registry_rows=[("fact:fact-1", 1)],
+            missing_text_rows=[("fact-1", "dog in park")],
+        )
         
         engine = HybridRetrievalEngine(llm, FakeEmbedder(), conn, FakeHydra())
         
