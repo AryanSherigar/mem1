@@ -1,0 +1,422 @@
+# HydraDB Long-Term Context Memory Engine
+
+A high-performance, provenance-preserving long-term memory substrate built on top of **HydraDB OpenCypher Graph** and **PostgreSQL 16 + pgvector**.
+
+Designed for production agentic applications and rigorous contextual benchmarks (such as **LongMemEval**), the engine turns unstructured, timestamped conversations into a durable, bitemporal graph with semantic vector indexing, 3-tier entity resolution, state-change tracking, and 4-phase hybrid retrieval with low-evidence abstention.
+
+---
+
+## 📑 Table of Contents
+
+- [Key Features](#-key-features)
+- [System Architecture](#-system-architecture)
+- [Prerequisites & Setup](#-prerequisites--setup)
+  - [1. Environment Setup](#1-environment-setup)
+  - [2. Configuration (.env)](#2-configuration-env)
+  - [3. Start PostgreSQL + pgvector](#3-start-postgresql--pgvector)
+- [How to Use the System](#-how-to-use-the-system)
+  - [1. Interactive CLI Chat REPL](#1-interactive-cli-chat-repl)
+  - [2. FastAPI REST Server](#2-fastapi-rest-server)
+  - [3. LongMemEval Benchmark Runner](#3-longmemeval-benchmark-runner)
+  - [4. Manual End-to-End Test Suite](#4-manual-end-to-end-test-suite)
+- [Core Concepts & Mechanics](#-core-concepts--mechanics)
+  - [4-Axis Bitemporal Model](#4-axis-bitemporal-model)
+  - [3-Tier Entity Resolution](#3-tier-entity-resolution)
+  - [4-Phase Hybrid Retrieval Pipeline](#4-phase-hybrid-retrieval-pipeline)
+- [Testing & Quality Assurance](#-testing--quality-assurance)
+- [Repository Map](#-repository-map)
+
+---
+
+## 🌟 Key Features
+
+- **Dual-Engine Persistence**:
+  - **PostgreSQL 16 + pgvector**: Canonical store for immutable raw text chunks, sha256 hashes, versioned 384-dim embeddings (`memory_embeddings`), full-text search indexes (`fact_search_index`), conversation buffers, and transactional ingestion job state.
+  - **HydraDB OpenCypher Graph**: Native graph storage and traversal engine for `Session`, `Turn`, `Fact`, `Entity`, and `Alias` nodes and `HAS_TURN`, `EXTRACTED_FROM`, `ABOUT`, `STATED_BY`, `SUPERSEDES`, and `MERGED_INTO` relationships.
+- **Bitemporal Knowledge State Tracking**:
+  - Distinguishes **Knowledge Time** (`observed_at`, `superseded_at`) from **World-Validity Time** (`valid_from`, `valid_to`).
+  - Creates non-destructive `(new)-[:SUPERSEDES]->(old)` graph edges on corrections and real-world state changes (e.g. moving cities, changing preferences).
+- **3-Tier Entity Resolution**:
+  - **Tier 1 (Exact Match)**: Instant normalized surface / alias matching.
+  - **Tier 2 (Semantic Blocking)**: In-memory cosine candidate retrieval via `EntityNameIndex`.
+  - **Tier 3 (Bounded LLM Disambiguation)**: Strict constrained selection over shortlisted entity profiles.
+- **4-Phase Hybrid Retrieval & Grounded Synthesis**:
+  - **Phase 0**: Temporal query resolution (extracting epoch bounds) + Multi-query rewriting & synonym expansion.
+  - **Phase 1**: Vector similarity search (over-fetching top-60) + BM25 `ts_rank` keyword scoring.
+  - **Phase 2**: HydraDB graph expansion (`[:ABOUT]`, multi-hop `algo.MSpaths`, `[:SUPERSEDES*1..5]`) with bitemporal filtering and 24h chat-scope TTL.
+  - **Phase 3**: 4-factor composite scoring (`semantic + keyword + structural + entity_boost`), strict low-evidence **Abstention Gate**, and Reader LLM answer synthesis.
+- **Universal Provider Neutrality**:
+  - Compatible with **Groq**, **Fireworks AI**, **OpenAI**, and **OpenRouter** via unified `LLMClient`.
+
+---
+
+## 🏛 System Architecture
+
+```mermaid
+flowchart TD
+    subgraph Ingestion ["1. Ingestion Pipeline"]
+        Source[Chat / LongMemEval Source] --> Adapter[Source Adapter]
+        Adapter --> Batch[ContextBatch / Records]
+        Batch --> Orchestrator[IngestionOrchestrator]
+        Orchestrator --> Extractor[LLMExtractor: Facts + Actions]
+        Extractor --> Resolver[3-Tier Entity Resolver]
+        Resolver --> UpdateClassifier[Temporal Update Classifier]
+        UpdateClassifier --> PlanBuilder[GraphPlanBuilder]
+    end
+
+    subgraph Storage ["2. Storage Substrate"]
+        PlanBuilder -->|Idempotent UNWIND Batches| HydraDB[(HydraDB Graph\nNodes: Session, Turn, Fact, Entity\nEdges: SUPERSEDES, ABOUT, etc.)]
+        Orchestrator -->|Immutable Chunks & Jobs| Postgres[(PostgreSQL 16 + pgvector\nfact_search_index\nmemory_embeddings\nconversation_buffer)]
+        Orchestrator -->|Hydration| MemoryIndex[(In-Memory NumPy\nEmbeddingIndex\nEntityNameIndex)]
+    end
+
+    subgraph Retrieval ["3. Hybrid Retrieval Pipeline"]
+        UserQuery[User Question] --> TemporalResolver[Phase 0: Temporal Query Resolver & Rewriter]
+        TemporalResolver --> Seeding[Phase 1: Vector Over-fetch + BM25 Seeding]
+        Seeding --> GraphExpansion[Phase 2: HydraDB Traversal & Bitemporal Filters]
+        GraphExpansion --> Scoring[Phase 3: 4-Factor Composite Scoring]
+        Scoring --> AbstentionGate{Score > Threshold?}
+        AbstentionGate -- No --> Abstain["I don't have that information in my memory."]
+        AbstentionGate -- Yes --> ReaderLLM[Reader LLM Synthesis]
+        ReaderLLM --> FinalAnswer[Grounded Answer]
+    end
+```
+
+---
+
+## 🚀 Prerequisites & Setup
+
+### Requirements
+- **Python 3.12+**
+- **Docker & Docker Compose** (for PostgreSQL + pgvector)
+- **Groq**, **Fireworks**, or **OpenAI** API key (for live LLM extraction & synthesis)
+
+### 1. Environment Setup
+
+Clone the repository and create a Python virtual environment:
+
+```bash
+# Create and activate virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies in editable mode
+pip install -e .
+```
+
+### 2. Configuration (`.env`)
+
+Create a `.env` file in the root directory (or export variables directly into your shell):
+
+```bash
+# --- LLM Provider Settings (Groq Example) ---
+export GROQ_API_KEY="gsk_your_groq_api_key"
+export GROQ_BASE_URL="https://api.groq.com/openai/v1"
+export EXTRACTOR_MODEL="openai/gpt-oss-20b"
+export READER_MODEL="openai/gpt-oss-20b"
+
+# --- Alternatively: Fireworks AI Example ---
+# export FIREWORKS_API_KEY="your_fireworks_api_key"
+# export FIREWORKS_BASE_URL="https://api.fireworks.ai/inference/v1"
+# export EXTRACTOR_MODEL="accounts/fireworks/models/deepseek-v4-flash-0731"
+
+# --- Storage Layer Settings ---
+export DATABASE_URL="postgresql://context_memory:context_memory@127.0.0.1:54329/context_memory"
+export CONTEXT_MEMORY_HYDRADB_URL="http://127.0.0.1:8080"
+export CONTEXT_MEMORY_HYDRADB_TOKEN="local-dev-token"
+export CONTEXT_MEMORY_HYDRADB_DATABASE="default"
+```
+
+### 3. Start PostgreSQL + pgvector
+
+Start the preconfigured PostgreSQL 16 + pgvector container using Docker Compose:
+
+```bash
+docker compose up -d postgres
+```
+
+The database includes automatic migrations in `db/migrations/` creating all required tables (`evidence_chunks`, `ingestion_jobs`, `graph_id_registry`, `memory_embeddings`, `fact_search_index`, `conversation_buffer`).
+
+---
+
+## 💻 How to Use the System
+
+The repository provides **four primary entry points**:
+
+```
+1. Interactive CLI Chat REPL    --> src/chat/interactive_chat.py
+2. FastAPI REST Server          --> src/api/server.py
+3. LongMemEval Benchmark Runner --> src/evaluation/benchmark_runner.py
+4. End-to-End Test Suite        --> scripts/manual_test_run.py
+```
+
+---
+
+### 1. Interactive CLI Chat REPL
+
+Launch a terminal session to chat interactively with the memory engine. Every turn automatically triggers live fact extraction, entity linking, and grounded conversational memory recall.
+
+```bash
+PYTHONPATH=src .venv/bin/python src/chat/interactive_chat.py
+```
+
+#### Example REPL Session:
+```text
+======================================================================
+  HYDRADB CONTEXT MEMORY ENGINE — INTERACTIVE REPL
+======================================================================
+Type your messages below. Available commands:
+  /exit or /quit - Exit the chat
+  /help          - Show help
+  /stats         - Show current session statistics
+----------------------------------------------------------------------
+[You]: I adopted a golden retriever dog named Max. We currently live in Seattle.
+[Assistant]: That's wonderful! Max sounds like a great companion. Seattle is a lovely city for dogs with plenty of parks.
+
+[You]: We actually moved to Boston last week!
+[Assistant]: Congratulations on the move to Boston! I've updated your location in memory.
+
+[You]: Where do I live and what pet do I have?
+[Assistant]: You currently live in Boston (having moved from Seattle), and you have a golden retriever dog named Max!
+```
+
+---
+
+### 2. FastAPI REST Server
+
+Start the production-ready REST API server:
+
+```bash
+PYTHONPATH=src .venv/bin/uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+#### API Endpoints & cURL Examples:
+
+#### A. Health Check (`GET /v1/health`)
+Verifies live connectivity to PostgreSQL and HydraDB:
+```bash
+curl -X GET http://localhost:8000/v1/health
+```
+```json
+{
+  "status": "healthy",
+  "postgres": "connected",
+  "hydradb": "connected"
+}
+```
+
+#### B. Conversational Chat (`POST /v1/chat`)
+Submits a user message, performs real-time retrieval over past memory, distills new facts asynchronously, and returns the grounded response:
+```bash
+curl -X POST http://localhost:8000/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "context_id": "user:alice_01",
+    "session_id": "sess_100",
+    "message": "I just bought a vintage red Ferrari 250 GTO in Monaco!"
+  }'
+```
+```json
+{
+  "context_id": "user:alice_01",
+  "session_id": "sess_100",
+  "response": "Congratulations! A vintage red Ferrari 250 GTO from Monaco is an extraordinary classic car.",
+  "status": "success"
+}
+```
+
+#### C. Search Facts (`POST /v1/memory/search`)
+Executes hybrid retrieval (vector + BM25 + HydraDB graph expansion) without calling the synthesis LLM:
+```bash
+curl -X POST http://localhost:8000/v1/memory/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "context_id": "user:alice_01",
+    "query": "What car did I buy?",
+    "top_k": 5
+  }'
+```
+
+#### D. Batch Ingestion (`POST /v1/memory/ingest`)
+Ingests historical sessions or documents via the generic `ContextBatch` contract:
+```bash
+curl -X POST http://localhost:8000/v1/memory/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ingestion_id": "batch-001",
+    "context_id": "user:alice_01",
+    "source": {
+      "source_type": "chat",
+      "source_version": "v1"
+    },
+    "records": [
+      {
+        "record_id": "turn-001",
+        "session_id": "sess_100",
+        "actor_role": "user",
+        "occurred_at": "2026-01-15T10:00:00Z",
+        "content_type": "text/plain",
+        "content": "I adopted a golden retriever named Max."
+      }
+    ]
+  }'
+```
+
+---
+
+### 3. LongMemEval Benchmark Runner
+
+Run standard contextual benchmarks from JSON datasets (e.g. `data/longmemeval_s_cleaned.json`) through the generic ingestion pipeline and generate standard `predictions.jsonl` output:
+
+```bash
+PYTHONPATH=src .venv/bin/python src/evaluation/benchmark_runner.py \
+  --input data/longmemeval_s_cleaned.json \
+  --output predictions.jsonl \
+  --extractor llm \
+  --limit 50
+```
+
+#### Arguments:
+- `--input`: Path to LongMemEval JSON dataset.
+- `--output`: Path for output predictions JSONL (`{"question_id": "...", "hypothesis": "..."}`).
+- `--extractor`: `llm` (uses configured LLM) or `deterministic` (uses benchmark baseline).
+- `--limit` / `--offset`: For batching evaluations.
+
+---
+
+### 4. Manual End-to-End Test Suite
+
+Run the complete pipeline verification script:
+
+```bash
+# Standalone mode (simulated LLM, zero credentials required):
+PYTHONPATH=src .venv/bin/python scripts/manual_test_run.py
+
+# Live mode (using Groq / Fireworks / OpenAI):
+PYTHONPATH=src .venv/bin/python scripts/manual_test_run.py --live \
+  --api-key "$GROQ_API_KEY" \
+  --base-url "https://api.groq.com/openai/v1" \
+  --model "openai/gpt-oss-20b"
+```
+
+The script verifies:
+1. Multi-turn episodic chat ingestion.
+2. Real-time fact extraction with action tags (`ADD`, `UPDATE`, `DELETE`) and predicate keys.
+3. 3-tier entity resolution and graph linking.
+4. Bitemporal `SUPERSEDES` edge creation on knowledge updates.
+5. Vector & BM25 index synchronization.
+6. 4-phase hybrid retrieval with grounded answers and strict abstention.
+
+---
+
+## 🧠 Core Concepts & Mechanics
+
+### 4-Axis Bitemporal Model
+
+To prevent memory corruption and allow historical analysis, every fact maintains four explicit integer epoch timestamps:
+
+| Axis | Field | Definition |
+|---|---|---|
+| **Knowledge Time** | `observed_at` | When the system learned the assertion. |
+| **Knowledge Time** | `superseded_at` | When newer evidence replaced this assertion (`9999999999` if active). |
+| **World Validity** | `valid_from` | When the assertion became true in the real world (`0` for open past). |
+| **World Validity** | `valid_to` | When the assertion stopped being true in the real world (`9999999999` for open future). |
+
+When an update occurs (e.g. moving from Seattle to Boston):
+1. `(Fact: Boston)-[:SUPERSEDES]->(Fact: Seattle)` edge is written to HydraDB.
+2. The old Seattle fact has its `valid_to` closed at the effective move date.
+3. The old Seattle fact is marked `is_current = false` but remains preserved for historical queries.
+
+---
+
+### 3-Tier Entity Resolution
+
+```
+Surface Mention ("Max", "Boston", "my dog")
+   │
+   ├──▶ Tier 1: Exact Match (Normalized Canonical / Alias) ──▶ Found? Done.
+   │
+   ├──▶ Tier 2: Semantic Blocking (EntityNameIndex Cosine Similarity) ──▶ Candidate Shortlist
+   │
+   └──▶ Tier 3: Bounded LLM Disambiguation (Select from Shortlist or Abstain)
+```
+
+---
+
+### 4-Phase Hybrid Retrieval Pipeline
+
+1. **Phase 0 — Query Resolution**:
+   - `TemporalQueryResolver`: Identifies target time ranges (e.g., "Where did I live *last summer*?").
+   - `QueryRewriter`: Decomposes multi-part questions and generates synonyms.
+2. **Phase 1 — Dual-Channel Seeding**:
+   - Exact cosine vector search (top-60 over-fetching) in `memory_embeddings`.
+   - BM25 full-text rank search in `fact_search_index`.
+3. **Phase 2 — HydraDB Graph Expansion**:
+   - Navigates `[:ABOUT]` entity relationships and multi-hop paths via `algo.MSpaths`.
+   - Traverses `[:SUPERSEDES*1..5]` chains.
+   - Applies bitemporal epoch filters and prunes expired 24h `chat`-scoped facts.
+4. **Phase 3 — Composite Scoring & Synthesis**:
+   - Computes 4-factor composite score:
+     $$\text{Score} = \frac{\text{Semantic} + \text{Keyword} + \text{Structural} + \text{EntityBoost}}{3.0}$$
+   - **Abstention Gate**: If $\text{Score}_{\max} < 0.25$ and $\text{Structural} = 0$, immediately abstains.
+   - Formats evidence blocks as `[{YYYY-MM-DD} | {speaker}]: {text}` for Reader LLM generation.
+
+---
+
+## 🧪 Testing & Quality Assurance
+
+Run the automated test suite across all subsystems:
+
+```bash
+# Run all 119 unit and integration tests
+PYTHONPATH=src .venv/bin/python -m unittest discover -s src/tests -v
+
+# Run FastAPI test suite
+PYTHONPATH=src .venv/bin/pytest src/api/test_server.py
+```
+
+### Verification Matrix:
+- **Contract & Domain Tests**: Deterministic ID generation, chunk immutability, memory types/scopes.
+- **Ingestion Pipeline**: Orchestrator state machine (`pending_graph` $\rightarrow$ `completed`), error recovery, idempotency replay.
+- **Model Adapters**: `LLMExtractor`, `LLMEntityResolutionModel`, `LLMTemporalUpdateModel`.
+- **Hybrid Retrieval**: Bitemporal pruning, BM25 scoring, abstention cutoffs.
+- **PostgreSQL Migrations**: Forward-only schema verification (`0001` through `0006`).
+
+---
+
+## 🗺 Repository Map
+
+```
+.
+├── compose.yaml                   # PostgreSQL 16 + pgvector Docker Compose definition
+├── db/
+│   └── migrations/                # Forward-only SQL migrations (0001 to 0006)
+├── hydradb/                       # Upstream HydraDB Rust graph database engine
+├── scripts/
+│   └── manual_test_run.py         # End-to-end integration test runner (offline & live)
+├── src/
+│   ├── api/
+│   │   ├── routes.py              # FastAPI endpoint handlers & engine dependency injection
+│   │   ├── server.py              # FastAPI application factory
+│   │   └── test_server.py         # API test suite
+│   ├── chat/
+│   │   └── interactive_chat.py    # Terminal REPL chat interface
+│   ├── evaluation/
+│   │   └── benchmark_runner.py    # LongMemEval benchmark runner
+│   ├── context_memory/
+│   │   ├── core/                  # Contracts, models, enums, config, LLMClient
+│   │   ├── ingestion/             # Orchestrator, extraction, resolution, graph_plan_builder
+│   │   ├── persistence/           # PostgreSQL store implementations
+│   │   ├── client/                # HydraDB HTTP transport client
+│   │   ├── engine.py              # High-level MemoryEngine interface
+│   │   ├── hydration.py           # Startup cache hydration manager
+│   │   └── retrieval.py           # 4-Phase Hybrid Retrieval Engine
+│   └── tests/                     # Comprehensive test suite (119 tests)
+└── FINAL_ARCHITECTURE.md          # Authoritative architectural specification
+```
+
+---
+
+## 📄 License
+
+Apache-2.0. See [LICENSE](LICENSE) for details.

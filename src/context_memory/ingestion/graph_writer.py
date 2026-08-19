@@ -5,8 +5,11 @@ from __future__ import annotations
 from collections import defaultdict
 from hashlib import sha256
 
-from context_memory.ingestion.ports import GraphManifestStore, GraphTransport
 from context_memory.core.graph import GraphNode, GraphRelationship, GraphWritePlan
+from context_memory.core.logging import get_logger, timed_operation
+from context_memory.ingestion.ports import GraphManifestStore, GraphTransport
+
+logger = get_logger(__name__)
 
 
 class GraphWriter:
@@ -15,23 +18,25 @@ class GraphWriter:
         self._transport = transport
 
     def write(self, plan: GraphWritePlan) -> tuple[str, ...]:
-        self._manifest_store.register(plan)
-        bookmarks: list[str] = []
-        nodes: dict[tuple[str, tuple[str, ...]], list[GraphNode]] = defaultdict(list)
-        relationships: dict[tuple[str, str, str, tuple[str, ...]], list[GraphRelationship]] = defaultdict(list)
-        for node in plan.nodes:
-            nodes[(node.label, tuple(sorted(node.properties)))].append(node)
-        for relationship in plan.relationships:
-            relationships[(relationship.relationship_type, relationship.source_label, relationship.destination_label, tuple(sorted(relationship.properties)))].append(relationship)
-        for (label, property_names), group in nodes.items():
-            bookmark = self._transport.write(self._node_query(label, property_names), self._node_rows(group), self._key(plan, f"node-{label}-{'-'.join(property_names)}"))
-            if bookmark:
-                bookmarks.append(bookmark)
-        for (relationship_type, source_label, destination_label, property_names), group in relationships.items():
-            bookmark = self._transport.write(self._relationship_query(relationship_type, source_label, destination_label, property_names), self._relationship_rows(group), self._key(plan, f"relationship-{relationship_type}-{source_label}-{destination_label}-{'-'.join(property_names)}"))
-            if bookmark:
-                bookmarks.append(bookmark)
-        return tuple(bookmarks)
+        with timed_operation(logger, "graph_writer.write", {"plan_key": plan.plan_key, "nodes": len(plan.nodes), "relationships": len(plan.relationships)}) as ctx:
+            self._manifest_store.register(plan)
+            bookmarks: list[str] = []
+            nodes: dict[tuple[str, tuple[str, ...]], list[GraphNode]] = defaultdict(list)
+            relationships: dict[tuple[str, str, str, tuple[str, ...]], list[GraphRelationship]] = defaultdict(list)
+            for node in plan.nodes:
+                nodes[(node.label, tuple(sorted(node.properties)))].append(node)
+            for relationship in plan.relationships:
+                relationships[(relationship.relationship_type, relationship.source_label, relationship.destination_label, tuple(sorted(relationship.properties)))].append(relationship)
+            for (label, property_names), group in nodes.items():
+                bookmark = self._transport.write(self._node_query(label, property_names), self._node_rows(group), self._key(plan, f"node-{label}-{'-'.join(property_names)}"))
+                if bookmark:
+                    bookmarks.append(bookmark)
+            for (relationship_type, source_label, destination_label, property_names), group in relationships.items():
+                bookmark = self._transport.write(self._relationship_query(relationship_type, source_label, destination_label, property_names), self._relationship_rows(group), self._key(plan, f"relationship-{relationship_type}-{source_label}-{destination_label}-{'-'.join(property_names)}"))
+                if bookmark:
+                    bookmarks.append(bookmark)
+            ctx["bookmarks_received"] = len(bookmarks)
+            return tuple(bookmarks)
 
     @staticmethod
     def _node_query(label: str, property_names: tuple[str, ...]) -> str:

@@ -104,6 +104,14 @@ class InMemoryEmbeddingStore:
                 )
 
 
+class InMemorySearchIndexStore:
+    def __init__(self) -> None:
+        self._rows: dict[str, str] = {}  # fact_id -> raw_text
+
+    def put(self, context_id: str, fact_id: str, raw_text: str) -> None:
+        self._rows[fact_id] = raw_text
+
+
 class InMemoryGraphIdAllocator:
     def __init__(self) -> None:
         self._ids: dict[tuple[str, str, str], int] = {}

@@ -233,6 +233,8 @@ class ExtractedMemoryCandidate:
     confidence: float
     temporal: TemporalBounds
     entities: tuple[EntityCandidate, ...] = ()
+    action: str = "ADD"
+    predicate_key: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.candidate_id, "candidate.candidate_id")
@@ -250,6 +252,10 @@ class ExtractedMemoryCandidate:
             raise ContractValidationError("candidate.confidence", "must be within 0.0..1.0")
         if not all(isinstance(entity, EntityCandidate) for entity in self.entities):
             raise ContractValidationError("candidate.entities", "must contain EntityCandidate values")
+        if self.action not in ("ADD", "UPDATE", "DELETE"):
+            raise ContractValidationError("candidate.action", "must be ADD, UPDATE, or DELETE")
+        if self.predicate_key is not None and not isinstance(self.predicate_key, str):
+            raise ContractValidationError("candidate.predicate_key", "must be a string")
 
 
 @dataclass(frozen=True)
@@ -267,6 +273,8 @@ class ExtractionDraft:
     valid_from: datetime | None = None
     valid_to: datetime | None = None
     entities: tuple[EntityCandidate, ...] = ()
+    action: str = "ADD"
+    predicate_key: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.candidate_id, "draft.candidate_id")
@@ -282,6 +290,10 @@ class ExtractionDraft:
         _optional_text(self.scope_id, "draft.scope_id")
         if not all(isinstance(entity, EntityCandidate) for entity in self.entities):
             raise ContractValidationError("draft.entities", "must contain EntityCandidate values")
+        if self.action not in ("ADD", "UPDATE", "DELETE"):
+            raise ContractValidationError("draft.action", "must be ADD, UPDATE, or DELETE")
+        if self.predicate_key is not None and not isinstance(self.predicate_key, str):
+            raise ContractValidationError("draft.predicate_key", "must be a string")
 
 
 @dataclass(frozen=True)

@@ -52,14 +52,17 @@ class FakeConnection:
 class MigrationTests(unittest.TestCase):
     def test_migrations_are_discovered(self) -> None:
         migrations = discover_migrations(MIGRATIONS)
-        self.assertEqual([migration.version for migration in migrations], ["0001", "0002", "0003"])
+        self.assertEqual([migration.version for migration in migrations], ["0001", "0002", "0003", "0004", "0005", "0006"])
         self.assertIn("evidence_chunks", migrations[0].sql)
         self.assertIn("extraction_attempts", migrations[1].sql)
         self.assertIn("graph_write_manifests", migrations[2].sql)
+        self.assertIn("conversation_buffer", migrations[3].sql)
+        self.assertIn("ALTER TABLE fact_search_index", migrations[4].sql)
+        self.assertIn("extraction_attempts", migrations[5].sql)
 
     def test_apply_is_idempotent(self) -> None:
         connection = FakeConnection()
-        self.assertEqual(apply_migrations(connection, MIGRATIONS), ("0001", "0002", "0003"))
+        self.assertEqual(apply_migrations(connection, MIGRATIONS), ("0001", "0002", "0003", "0004", "0005", "0006"))
         self.assertEqual(apply_migrations(connection, MIGRATIONS), ())
 
     def test_checksum_drift_is_rejected(self) -> None:

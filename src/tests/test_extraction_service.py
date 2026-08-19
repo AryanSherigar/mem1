@@ -84,3 +84,37 @@ class ExtractionServiceTests(unittest.TestCase):
         batch, record = self.batch()
         with self.assertRaisesRegex(ValueError, "only deterministic-fixture"):
             ExtractionService(NonFixture(), InMemoryExtractionStore()).extract(batch, record, chunk_from_record(batch, record))
+
+from context_memory.ingestion.extraction import LLMExtractionService, ExtractionResponse, ExtractedDraft
+
+class FakeLLMClient:
+    def __init__(self, response):
+        self.response = response
+    def structured_completion(self, system, user, schema):
+        return self.response
+
+class FakeContextRepo:
+    def get_conversation_buffer(self, context_id, session_id, limit):
+        return [{"role": "user", "content": "I have a dog named Max."}]
+    def get_top_candidate_facts(self, context_id, content, limit):
+        return []
+
+class LLMExtractionServiceTests(unittest.TestCase):
+    def batch(self, *, session_id: str | None = "session-001") -> tuple[ContextBatch, ContextRecord]:
+        record = ContextRecord(
+            record_id="record-001", session_id=session_id, actor_role="user",
+            occurred_at=datetime(2026, 1, 10, 9, tzinfo=timezone.utc), content="café 🐶 likes walks"
+        )
+        return ContextBatch("ingestion-001", "context-001", SourceDescriptor("fixture", "fixture-001"), (record,)), record
+    
+    def test_llm_extraction(self):
+        batch, record = self.batch()
+        llm = FakeLLMClient(ExtractionResponse(drafts=[ExtractedDraft(text="Dog likes walks", confidence=0.9, action="UPDATE", predicate_key="pet_preference")]))
+        repo = FakeContextRepo()
+        store = InMemoryExtractionStore()
+        service = LLMExtractionService(llm, store, repo)
+        
+        result = service.extract(batch, record, chunk_from_record(batch, record))
+        self.assertEqual(len(result.accepted), 1)
+        self.assertEqual(result.accepted[0].action, "UPDATE")
+        self.assertEqual(result.accepted[0].predicate_key, "pet_preference")

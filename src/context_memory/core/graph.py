@@ -10,7 +10,7 @@ from typing import Mapping
 from context_memory.core.errors import ContractValidationError
 
 NODE_LABELS = frozenset({"Session", "Turn", "Fact", "Entity", "Alias"})
-RELATIONSHIP_TYPES = frozenset({"HAS_TURN", "EXTRACTED_FROM", "ABOUT", "HAS_ALIAS", "SUPERSEDES", "RELATES_TO"})
+RELATIONSHIP_TYPES = frozenset({"HAS_TURN", "EXTRACTED_FROM", "ABOUT", "HAS_ALIAS", "SUPERSEDES", "RELATES_TO", "STATED_BY", "MERGED_INTO"})
 SCALAR = (str, int, float, bool)
 
 

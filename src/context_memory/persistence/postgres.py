@@ -235,6 +235,26 @@ class PostgresGraphManifestStore:
         return {"type": record.relationship_type, "id": record.graph_id, "source": record.source_id, "destination": record.destination_id, "source_label": record.source_label, "destination_label": record.destination_label, "properties": dict(record.properties)}
 
 
+class PostgresSearchIndexStore:
+    """PostgreSQL-backed full-text search index for BM25 keyword retrieval."""
+
+    def __init__(self, connection: object) -> None:
+        self._connection = connection
+
+    def put(self, context_id: str, fact_id: str, raw_text: str) -> None:
+        with self._connection.transaction():
+            with self._connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO fact_search_index (fact_id, context_id, raw_text, is_active)
+                    VALUES (%s, %s, %s, true)
+                    ON CONFLICT (fact_id) DO UPDATE 
+                    SET raw_text = EXCLUDED.raw_text, is_active = true
+                    """,
+                    (fact_id, context_id, raw_text)
+                )
+
+
 class PostgresEmbeddingStore:
     """Versioned fact/chunk embedding persistence against `memory_embeddings` (Milestone 7)."""
 

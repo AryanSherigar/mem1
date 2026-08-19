@@ -68,6 +68,12 @@ class ExtractionStore(Protocol):
     ) -> None: ...
 
 
+class SearchIndexStore(Protocol):
+    """PostgreSQL-backed full-text search index for BM25 keyword retrieval."""
+
+    def put(self, context_id: str, fact_id: str, raw_text: str) -> None: ...
+
+
 class GraphIdAllocator(Protocol):
     """Stable graph IDs are allocated in PostgreSQL before HydraDB writes."""
 

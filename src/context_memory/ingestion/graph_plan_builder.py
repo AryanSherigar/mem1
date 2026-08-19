@@ -24,6 +24,7 @@ at the resolution layer, preserved here rather than re-litigated.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from collections.abc import Callable
 from typing import Mapping
 
@@ -46,6 +47,12 @@ def _scalar_properties(context_id: str, **fields: object) -> dict[str, object]:
     return properties
 
 
+from context_memory.core.resolution import FactState, TemporalRelation
+from context_memory.ingestion.resolution import TemporalUpdateClassifier
+
+FindExistingFacts = Callable[[str, int, str], list[FactState]]
+"""(context_id, subject_entity_id, predicate_key) -> list of active FactStates for that subject and predicate."""
+
 class GraphPlanBuilder:
     """Builds one `GraphWritePlan` per chunk from its accepted extraction output."""
 
@@ -57,36 +64,88 @@ class GraphPlanBuilder:
         chunk: Chunk,
         extraction: ExtractionResult,
         resolve: ResolveEntity,
+        update_classifier: TemporalUpdateClassifier | None = None,
+        find_existing_facts: FindExistingFacts | None = None,
     ) -> GraphWritePlan:
         context_id = chunk.context_id
         nodes: dict[int, GraphNode] = {}
         relationships: dict[int, GraphRelationship] = {}
 
         session_key = chunk.session_id or f"context:{context_id}"
-        session_node = self._session_node(context_id, session_key)
+        session_node = self._session_node(chunk)
         turn_node = self._turn_node(chunk)
         nodes[session_node.graph_id] = session_node
         nodes[turn_node.graph_id] = turn_node
         has_turn = self._has_turn_edge(context_id, session_key, session_node, turn_node, chunk)
         relationships[has_turn.graph_id] = has_turn
+        
+        # Speaker node
+        speaker_node = self._speaker_entity_node(chunk)
+        nodes[speaker_node.graph_id] = speaker_node
+        
+        created_at_dt = datetime.now(timezone.utc)
 
         for candidate in extraction.accepted:
-            fact_node = self._fact_node(chunk, candidate)
+            fact_node = self._fact_node(chunk, candidate, created_at_dt)
             nodes[fact_node.graph_id] = fact_node
+            
             extracted_from = self._extracted_from_edge(context_id, candidate, fact_node, turn_node, chunk)
             relationships[extracted_from.graph_id] = extracted_from
+            
+            stated_by = self._stated_by_edge(context_id, candidate, fact_node, speaker_node)
+            relationships[stated_by.graph_id] = stated_by
 
+            subject_entity_node = None
             for entity_candidate in candidate.entities:
                 profile = resolve(context_id, entity_candidate.surface, entity_candidate.entity_type or "other")
                 if profile is None:
                     continue  # unresolved mention: no forced link (ADR-020)
                 entity_node = self._entity_node(profile)
+                if subject_entity_node is None:
+                    subject_entity_node = entity_node
                 nodes[entity_node.graph_id] = entity_node
                 about = self._about_edge(context_id, candidate, fact_node, entity_node, entity_candidate.surface)
                 relationships[about.graph_id] = about
                 for alias_node, has_alias in self._alias_records(profile):
                     nodes[alias_node.graph_id] = alias_node
                     relationships[has_alias.graph_id] = has_alias
+
+            if candidate.action == "UPDATE" and candidate.predicate_key and subject_entity_node and update_classifier and find_existing_facts:
+                new_fact_state = FactState(
+                    fact_id=candidate.candidate_id,
+                    subject_entity_id=subject_entity_node.graph_id,
+                    predicate_key=candidate.predicate_key,
+                    text=candidate.text,
+                    observed_at=candidate.temporal.observed_at,
+                    valid_from=candidate.temporal.valid_from,
+                    valid_to=candidate.temporal.valid_to
+                )
+                existing_facts = find_existing_facts(context_id, subject_entity_node.graph_id, candidate.predicate_key)
+                
+                for prior_fact in existing_facts:
+                    decision = update_classifier.classify(new_fact=new_fact_state, prior_fact=prior_fact)
+                    if decision.relation in (TemporalRelation.CORRECTION, TemporalRelation.STATE_CHANGE):
+                        # Create SUPERSEDES edge
+                        edge_logical_key = f"supersedes:{candidate.candidate_id}:{prior_fact.fact_id}"
+                        edge_graph_id = self._allocator.allocate_graph_id("supersedes", context_id, edge_logical_key)
+                        
+                        prior_fact_graph_id = self._allocator.allocate_graph_id("fact", context_id, f"fact:{prior_fact.fact_id}")
+                        supersedes_edge = GraphRelationship(
+                            edge_graph_id, "SUPERSEDES", edge_logical_key, fact_node.graph_id, prior_fact_graph_id,
+                            "Fact", "Fact", _scalar_properties(context_id)
+                        )
+                        relationships[supersedes_edge.graph_id] = supersedes_edge
+                        
+                        # Update old fact
+                        nodes[prior_fact_graph_id] = GraphNode(
+                            prior_fact_graph_id, "Fact", f"fact:{prior_fact.fact_id}",
+                            _scalar_properties(
+                                context_id,
+                                is_current=False,
+                                superseded_at=int(decision.prior_superseded_at.timestamp()) if decision.prior_superseded_at else 9999999999,
+                                valid_to=int(decision.prior_valid_to.timestamp()) if decision.prior_valid_to else 9999999999
+                            )
+                        )
 
         plan_key = f"plan:{chunk.chunk_id}"
         return GraphWritePlan(
@@ -96,14 +155,35 @@ class GraphPlanBuilder:
             relationships=tuple(relationships.values()),
         )
 
-    def _session_node(self, context_id: str, session_key: str) -> GraphNode:
+    def _session_node(self, chunk: Chunk) -> GraphNode:
+        session_key = chunk.session_id or "unknown"
         logical_key = f"session:{session_key}"
-        graph_id = self._allocator.allocate_graph_id("session", context_id, logical_key)
-        return GraphNode(graph_id, "Session", logical_key, _scalar_properties(context_id, session_key=session_key))
+        graph_id = self._allocator.allocate_graph_id("session", chunk.context_id, logical_key)
+        
+        # Calculate properties
+        dt = chunk.occurred_at
+        date_str = dt.strftime("%Y-%m-%d")
+        date_epoch = int(dt.timestamp())
+        
+        metadata = chunk.metadata or {}
+        turn_count = metadata.get("turn_count", 0)
+        source_index = metadata.get("source_index", 0)
+        
+        properties = _scalar_properties(
+            chunk.context_id,
+            session_id=session_key,
+            date=date_str,
+            date_epoch=date_epoch,
+            turn_count=turn_count,
+            source_index=source_index
+        )
+        return GraphNode(graph_id, "Session", logical_key, properties)
 
     def _turn_node(self, chunk: Chunk) -> GraphNode:
         logical_key = f"turn:{chunk.chunk_id}"
         graph_id = self._allocator.allocate_graph_id("turn", chunk.context_id, logical_key)
+        metadata = chunk.metadata or {}
+        
         properties = _scalar_properties(
             chunk.context_id,
             chunk_id=chunk.chunk_id,
@@ -112,6 +192,8 @@ class GraphPlanBuilder:
             occurred_at=chunk.occurred_at.isoformat(),
             actor_role=chunk.actor_role,
             actor_id=chunk.actor_id,
+            turn_index=metadata.get("turn_index", 0),
+            session_id=chunk.session_id or "unknown"
         )
         return GraphNode(graph_id, "Turn", logical_key, properties)
 
@@ -125,22 +207,53 @@ class GraphPlanBuilder:
             "Session", "Turn", _scalar_properties(context_id),
         )
 
-    def _fact_node(self, chunk: Chunk, candidate: ExtractedMemoryCandidate) -> GraphNode:
+    def _speaker_entity_node(self, chunk: Chunk) -> GraphNode:
+        role = chunk.actor_role or "unknown"
+        logical_key = f"entity:{role}"
+        graph_id = self._allocator.allocate_graph_id("entity", chunk.context_id, logical_key)
+        return GraphNode(
+            graph_id, "Entity", logical_key,
+            _scalar_properties(chunk.context_id, canonical_name=role, entity_type="speaker"),
+        )
+
+    def _stated_by_edge(
+        self, context_id: str, candidate: ExtractedMemoryCandidate, fact_node: GraphNode, speaker_node: GraphNode
+    ) -> GraphRelationship:
+        logical_key = f"stated_by:{candidate.candidate_id}:{speaker_node.graph_id}"
+        graph_id = self._allocator.allocate_graph_id("stated_by", context_id, logical_key)
+        return GraphRelationship(
+            graph_id, "STATED_BY", logical_key, fact_node.graph_id, speaker_node.graph_id,
+            "Fact", "Entity", _scalar_properties(context_id)
+        )
+
+    def _fact_node(self, chunk: Chunk, candidate: ExtractedMemoryCandidate, created_at_dt: datetime) -> GraphNode:
         logical_key = f"fact:{candidate.candidate_id}"
         graph_id = self._allocator.allocate_graph_id("fact", chunk.context_id, logical_key)
+        
+        obs_epoch = int(candidate.temporal.observed_at.timestamp())
+        v_from_epoch = int(candidate.temporal.valid_from.timestamp()) if candidate.temporal.valid_from else 0
+        v_to_epoch = int(candidate.temporal.valid_to.timestamp()) if candidate.temporal.valid_to else 9999999999
+        created_epoch = int(created_at_dt.timestamp())
+        
         properties = _scalar_properties(
             chunk.context_id,
             text=candidate.text,
+            speaker=chunk.actor_role,
+            session_id=chunk.session_id or "unknown",
             memory_type=candidate.memory_type.value,
             scope_type=candidate.scope_type.value,
             scope_id=candidate.scope_id,
             source_chunk_id=chunk.chunk_id,
             source_start=candidate.source_span.source_start,
             source_end=candidate.source_span.source_end,
+            content_hash=chunk.content_hash,
             confidence=candidate.confidence,
-            observed_at=candidate.temporal.observed_at.isoformat(),
-            valid_from=candidate.temporal.valid_from.isoformat() if candidate.temporal.valid_from else None,
-            valid_to=candidate.temporal.valid_to.isoformat() if candidate.temporal.valid_to else None,
+            observed_at=obs_epoch,
+            superseded_at=9999999999,
+            valid_from=v_from_epoch,
+            valid_to=v_to_epoch,
+            created_at=created_epoch,
+            is_current=True,
         )
         return GraphNode(graph_id, "Fact", logical_key, properties)
 

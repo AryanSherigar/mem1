@@ -14,11 +14,12 @@ from context_memory.core.resolution import (
     TemporalUpdateDecision,
     canonicalize_entity_surface,
 )
-
+from db.embedding_index import EntityNameIndex
 
 class EntityRegistry:
-    def __init__(self, allocator: GraphIdAllocator) -> None:
+    def __init__(self, allocator: GraphIdAllocator, name_index: EntityNameIndex | None = None) -> None:
         self._allocator = allocator
+        self._name_index = name_index
         self._profiles: dict[int, EntityProfile] = {}
 
     def register(self, profile: EntityProfile) -> None:
@@ -26,6 +27,11 @@ class EntityRegistry:
         if existing is not None and existing != profile:
             raise ValueError(f"graph ID {profile.graph_id} has conflicting entity content")
         self._profiles[profile.graph_id] = profile
+
+    def resolve_entity(self, context_id: str, surface: str, entity_type: str = "other") -> EntityProfile | None:
+        """Helper adapter matching GraphPlanBuilder.ResolveEntity callable."""
+        res = self.resolve(context_id=context_id, surface=surface, entity_type=entity_type)
+        return res.entity
 
     def resolve(
         self,
@@ -36,6 +42,18 @@ class EntityRegistry:
         candidate_ids: Iterable[int] = (),
         model: EntityResolutionModel | None = None,
     ) -> EntityResolution:
+        # Fetch dynamic candidates from Tier-2 Cache if available
+        candidate_ids = list(candidate_ids)
+        if self._name_index and not candidate_ids:
+            candidates = self._name_index.find_candidates(query_name=surface, entity_type=entity_type, haystack_id=context_id)
+            for c in candidates:
+                # EntityNameIndex returns string IDs. In the real system they might need mapping back to graph IDs,
+                # but if they match graph IDs (which are int), we map them back.
+                try:
+                    candidate_ids.append(int(c["entity_id"]))
+                except ValueError:
+                    pass
+        
         canonical = canonicalize_entity_surface(surface)
         in_context = [profile for profile in self._profiles.values() if profile.context_id == context_id]
         canonicals = [profile for profile in in_context if canonicalize_entity_surface(profile.canonical_name) == canonical]

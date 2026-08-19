@@ -7,6 +7,10 @@ from collections.abc import Callable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from context_memory.core.logging import get_logger, timed_operation
+
+logger = get_logger(__name__)
+
 
 class HydraHttpError(RuntimeError):
     """Local graph-node HTTP failure; bearer token never appears in this error."""
@@ -24,23 +28,28 @@ class HydraHttpTransport:
         self._cell_id, self._requester = cell_id, requester or _request_json
 
     def write(self, cypher: str, rows: Sequence[dict[str, object]], idempotency_key: str) -> str | None:
-        response = self._query(cypher, {"rows": list(rows)}, query_id=idempotency_key)
-        bookmark = response.get("bookmark")
-        if bookmark is not None and not isinstance(bookmark, str):
-            raise HydraHttpError("HydraDB returned an invalid bookmark")
-        return bookmark
+        with timed_operation(logger, "hydradb.write", {"rows_count": len(rows), "idempotency_key": idempotency_key}) as ctx:
+            response = self._query(cypher, {"rows": list(rows)}, query_id=idempotency_key)
+            bookmark = response.get("bookmark")
+            if bookmark is not None and not isinstance(bookmark, str):
+                raise HydraHttpError("HydraDB returned an invalid bookmark")
+            ctx["bookmark"] = bookmark
+            return bookmark
 
     def read(self, cypher: str, parameters: dict[str, object], bookmark: str | None) -> Sequence[dict[str, object]]:
-        response = self._query(cypher, parameters, bookmark=bookmark)
-        columns, rows = response.get("columns"), response.get("rows")
-        if not isinstance(columns, list) or not all(isinstance(column, str) for column in columns) or not isinstance(rows, list):
-            raise HydraHttpError("HydraDB returned invalid query rows")
-        result: list[dict[str, object]] = []
-        for row in rows:
-            if not isinstance(row, list) or len(row) != len(columns):
-                raise HydraHttpError("HydraDB returned a malformed query row")
-            result.append({column: _decode_value(value) for column, value in zip(columns, row, strict=True)})
-        return result
+        snippet = cypher[:60].replace("\n", " ") + "..." if len(cypher) > 60 else cypher
+        with timed_operation(logger, "hydradb.read", {"query_snippet": snippet}) as ctx:
+            response = self._query(cypher, parameters, bookmark=bookmark)
+            columns, rows = response.get("columns"), response.get("rows")
+            if not isinstance(columns, list) or not all(isinstance(column, str) for column in columns) or not isinstance(rows, list):
+                raise HydraHttpError("HydraDB returned invalid query rows")
+            result: list[dict[str, object]] = []
+            for row in rows:
+                if not isinstance(row, list) or len(row) != len(columns):
+                    raise HydraHttpError("HydraDB returned a malformed query row")
+                result.append({column: _decode_value(value) for column, value in zip(columns, row, strict=True)})
+            ctx["result_rows"] = len(result)
+            return result
 
     def _query(self, cypher: str, parameters: Mapping[str, object], *, query_id: str | None = None, bookmark: str | None = None) -> Mapping[str, object]:
         payload: dict[str, object] = {"cell_id": self._cell_id, "query": cypher, "parameters": parameters}

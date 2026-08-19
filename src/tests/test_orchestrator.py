@@ -15,6 +15,7 @@ from context_memory.ingestion.fakes import (
     InMemoryGraphIdAllocator,
     InMemoryGraphManifestStore,
     InMemoryJobStore,
+    InMemorySearchIndexStore,
     RecordingGraphTransport,
 )
 from context_memory.ingestion.graph_plan_builder import GraphPlanBuilder
@@ -47,6 +48,7 @@ class OrchestratorTests(unittest.TestCase):
         self.allocator = InMemoryGraphIdAllocator()
         self.manifest_store = InMemoryGraphManifestStore()
         self.embedding_store = InMemoryEmbeddingStore()
+        self.search_index_store = InMemorySearchIndexStore()
         self.entity_registry = EntityRegistry(self.allocator)
 
     def batch_and_record(self, content: str = "Max the dog likes walks", session_id: str = "session-001"):
@@ -77,6 +79,7 @@ class OrchestratorTests(unittest.TestCase):
             chunk_store=self.chunk_store, job_store=self.job_store, extraction_service=extraction_service,
             graph_plan_builder=plan_builder, graph_writer=graph_writer, resolve_entity=resolve_entity,
             embedder=DeterministicEmbedder(), embedding_store=self.embedding_store,
+            search_index_store=self.search_index_store,
         )
 
     def test_happy_path_reaches_completed(self) -> None:
@@ -87,6 +90,9 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(result.accepted_fact_count, 1)
         job = self.job_store.get(result.chunk_id)
         self.assertEqual(job.state, IngestionJobState.COMPLETED)
+        # Verify search index was populated
+        self.assertIn("fact-001", self.search_index_store._rows)
+        self.assertEqual(self.search_index_store._rows["fact-001"], "Max likes walks")
 
     def test_happy_path_writes_graph_and_embedding(self) -> None:
         batch, record = self.batch_and_record()
@@ -112,6 +118,7 @@ class OrchestratorTests(unittest.TestCase):
             chunk_store=self.chunk_store, job_store=self.job_store, extraction_service=extraction_service,
             graph_plan_builder=GraphPlanBuilder(self.allocator), graph_writer=GraphWriter(self.manifest_store, transport),
             resolve_entity=lambda *a: None, embedder=DeterministicEmbedder(), embedding_store=self.embedding_store,
+            search_index_store=self.search_index_store,
         )
         result = orchestrator.run_record(batch, record)
         self.assertEqual(result.state, IngestionJobState.COMPLETED)

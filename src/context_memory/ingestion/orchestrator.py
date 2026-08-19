@@ -28,12 +28,15 @@ from hashlib import sha256
 
 from context_memory.core.enums import IngestionJobState
 from context_memory.core.errors import ContractValidationError, GraphPayloadConflictError, ImmutableRecordConflictError
+from context_memory.core.logging import get_logger, timed_operation
 from context_memory.core.models import Chunk, ContextBatch, ContextRecord, Embedding
 from context_memory.core.validation import chunk_from_record
 from context_memory.ingestion.extraction import ExtractionService
 from context_memory.ingestion.graph_plan_builder import GraphPlanBuilder, ResolveEntity
 from context_memory.ingestion.graph_writer import GraphWriter
-from context_memory.ingestion.ports import ChunkStore, Embedder, EmbeddingStore, JobStore
+from context_memory.ingestion.ports import ChunkStore, Embedder, EmbeddingStore, JobStore, SearchIndexStore
+
+logger = get_logger(__name__)
 
 # Errors that mean the payload/policy itself is invalid; retrying unchanged input cannot help.
 _TERMINAL_ERROR_TYPES = (ContractValidationError, ImmutableRecordConflictError, GraphPayloadConflictError)
@@ -69,6 +72,9 @@ class IngestionOrchestrator:
         resolve_entity: ResolveEntity,
         embedder: Embedder,
         embedding_store: EmbeddingStore,
+        search_index_store: SearchIndexStore,
+        update_classifier: Any | None = None,
+        find_existing_facts: Any | None = None,
     ) -> None:
         self._chunk_store = chunk_store
         self._job_store = job_store
@@ -78,10 +84,16 @@ class IngestionOrchestrator:
         self._resolve_entity = resolve_entity
         self._embedder = embedder
         self._embedding_store = embedding_store
+        self._search_index_store = search_index_store
+        self._update_classifier = update_classifier
+        self._find_existing_facts = find_existing_facts
 
     def run_batch(self, batch: ContextBatch) -> BatchRunResult:
-        results = [self.run_record(batch, record) for record in batch.records]
-        return BatchRunResult(context_id=batch.context_id, results=tuple(results))
+        with timed_operation(logger, "orchestrator.run_batch", {"batch_id": batch.ingestion_id, "context_id": batch.context_id, "records": len(batch.records)}) as ctx:
+            results = [self.run_record(batch, record) for record in batch.records]
+            completed = sum(1 for r in results if r.state == IngestionJobState.COMPLETED)
+            ctx["completed_count"] = completed
+            return BatchRunResult(context_id=batch.context_id, results=tuple(results))
 
     def run_record(self, batch: ContextBatch, record: ContextRecord) -> ChunkRunResult:
         chunk = chunk_from_record(batch, record)
@@ -95,41 +107,72 @@ class IngestionOrchestrator:
         self, batch: ContextBatch, record: ContextRecord, chunk: Chunk, current_state: IngestionJobState
     ) -> ChunkRunResult:
         if current_state == IngestionJobState.COMPLETED:
+            logger.debug("Chunk %s already in COMPLETED state; skipping.", chunk.chunk_id)
             return ChunkRunResult(chunk.chunk_id, IngestionJobState.COMPLETED)
         if current_state in (IngestionJobState.TERMINAL_FAILED, IngestionJobState.MANUAL_REPAIR):
+            logger.warning("Chunk %s is in %s state; skipping auto-retry.", chunk.chunk_id, current_state.value)
             return ChunkRunResult(chunk.chunk_id, current_state, error="blocked: requires manual repair, not auto-retried")
 
-        try:
-            extraction = self._extraction_service.extract(batch, record, chunk)
-            plan = self._graph_plan_builder.build(chunk, extraction, self._resolve_entity)
-            self._graph_writer.write(plan)
-            self._job_store.transition(chunk.chunk_id, IngestionJobState.PENDING_EMBEDDINGS)
+        with timed_operation(logger, "orchestrator.run_chunk", {"chunk_id": chunk.chunk_id, "context_id": chunk.context_id}) as chunk_ctx:
+            try:
+                with timed_operation(logger, "orchestrator.stage.extraction", {"chunk_id": chunk.chunk_id}) as stage_ctx:
+                    extraction = self._extraction_service.extract(batch, record, chunk)
+                    stage_ctx["accepted_facts"] = len(extraction.accepted)
+                    stage_ctx["rejected_facts"] = len(extraction.rejected)
 
-            for candidate in extraction.accepted:
-                vector = self._embedder.embed(candidate.text)
-                self._embedding_store.put(
-                    Embedding(
-                        context_id=chunk.context_id, subject_kind="fact", subject_id=candidate.candidate_id,
-                        source_chunk_id=chunk.chunk_id, model_name=getattr(self._embedder, "model_name", "unknown"),
-                        model_version=getattr(self._embedder, "model_version", "1"), values=vector,
-                        embedded_content_hash=f"sha256:{sha256(candidate.text.encode('utf-8')).hexdigest()}",
+                with timed_operation(logger, "orchestrator.stage.graph_plan", {"chunk_id": chunk.chunk_id}) as stage_ctx:
+                    plan = self._graph_plan_builder.build(
+                        chunk,
+                        extraction,
+                        self._resolve_entity,
+                        update_classifier=self._update_classifier,
+                        find_existing_facts=self._find_existing_facts,
                     )
-                )
-            self._job_store.transition(chunk.chunk_id, IngestionJobState.VERIFYING)
+                    stage_ctx["nodes_count"] = len(plan.nodes)
+                    stage_ctx["edges_count"] = len(plan.relationships)
 
-            # Same-process verification, not an independent store re-read (see module docstring).
-            verified_chunk = self._chunk_store.get(chunk.context_id, chunk.chunk_id)
-            if verified_chunk is None or verified_chunk.content_hash != chunk.content_hash:
-                raise RuntimeError(f"post-write verification failed for chunk {chunk.chunk_id}")
+                with timed_operation(logger, "orchestrator.stage.graph_write", {"chunk_id": chunk.chunk_id}):
+                    self._graph_writer.write(plan)
+                    self._job_store.transition(chunk.chunk_id, IngestionJobState.PENDING_EMBEDDINGS)
 
-            self._job_store.transition(chunk.chunk_id, IngestionJobState.COMPLETED)
-            return ChunkRunResult(chunk.chunk_id, IngestionJobState.COMPLETED, accepted_fact_count=len(extraction.accepted))
-        except _TERMINAL_ERROR_TYPES as error:
-            self._safe_transition(chunk.chunk_id, IngestionJobState.TERMINAL_FAILED, str(error))
-            return ChunkRunResult(chunk.chunk_id, IngestionJobState.TERMINAL_FAILED, error=str(error))
-        except Exception as error:  # transient/unclassified: safe to retry (idempotent stages, see docstring)
-            self._safe_transition(chunk.chunk_id, IngestionJobState.RETRYABLE_FAILED, str(error))
-            return ChunkRunResult(chunk.chunk_id, IngestionJobState.RETRYABLE_FAILED, error=str(error))
+                with timed_operation(logger, "orchestrator.stage.embeddings_and_search_index", {"chunk_id": chunk.chunk_id, "facts_to_embed": len(extraction.accepted)}):
+                    for candidate in extraction.accepted:
+                        vector = self._embedder.embed(candidate.text)
+                        self._embedding_store.put(
+                            Embedding(
+                                context_id=chunk.context_id, subject_kind="fact", subject_id=candidate.candidate_id,
+                                source_chunk_id=chunk.chunk_id, model_name=getattr(self._embedder, "model_name", "unknown"),
+                                model_version=getattr(self._embedder, "model_version", "1"), values=vector,
+                                embedded_content_hash=f"sha256:{sha256(candidate.text.encode('utf-8')).hexdigest()}",
+                            )
+                        )
+                        self._search_index_store.put(
+                            context_id=chunk.context_id,
+                            fact_id=candidate.candidate_id,
+                            raw_text=candidate.text
+                        )
+                    self._job_store.transition(chunk.chunk_id, IngestionJobState.VERIFYING)
+
+                with timed_operation(logger, "orchestrator.stage.verification", {"chunk_id": chunk.chunk_id}):
+                    # Same-process verification, not an independent store re-read (see module docstring).
+                    verified_chunk = self._chunk_store.get(chunk.context_id, chunk.chunk_id)
+                    if verified_chunk is None or verified_chunk.content_hash != chunk.content_hash:
+                        raise RuntimeError(f"post-write verification failed for chunk {chunk.chunk_id}")
+
+                self._job_store.transition(chunk.chunk_id, IngestionJobState.COMPLETED)
+                chunk_ctx["final_state"] = IngestionJobState.COMPLETED.value
+                chunk_ctx["accepted_facts"] = len(extraction.accepted)
+                return ChunkRunResult(chunk.chunk_id, IngestionJobState.COMPLETED, accepted_fact_count=len(extraction.accepted))
+            except _TERMINAL_ERROR_TYPES as error:
+                logger.error("Terminal error processing chunk %s: %s", chunk.chunk_id, error, exc_info=True)
+                self._safe_transition(chunk.chunk_id, IngestionJobState.TERMINAL_FAILED, str(error))
+                chunk_ctx["final_state"] = IngestionJobState.TERMINAL_FAILED.value
+                return ChunkRunResult(chunk.chunk_id, IngestionJobState.TERMINAL_FAILED, error=str(error))
+            except Exception as error:  # transient/unclassified: safe to retry (idempotent stages, see docstring)
+                logger.warning("Retryable error processing chunk %s: %s", chunk.chunk_id, error, exc_info=True)
+                self._safe_transition(chunk.chunk_id, IngestionJobState.RETRYABLE_FAILED, str(error))
+                chunk_ctx["final_state"] = IngestionJobState.RETRYABLE_FAILED.value
+                return ChunkRunResult(chunk.chunk_id, IngestionJobState.RETRYABLE_FAILED, error=str(error))
 
     def _safe_transition(self, chunk_id: str, state: IngestionJobState, error: str) -> None:
         try:

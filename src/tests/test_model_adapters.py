@@ -115,5 +115,55 @@ class TemporalUpdateModelTests(unittest.TestCase):
         self.assertEqual(model.classify_update(new_fact=new, prior_fact=prior), TemporalRelation.UNRESOLVED)
 
 
+from context_memory.core.models import ContextRecord
+from context_memory.ingestion.model_adapters import LLMEntityResolutionModel, LLMExtractor, LLMTemporalUpdateModel
+
+
+class LLMExtractorTests(unittest.TestCase):
+    def test_extract_facts_happy_path(self) -> None:
+        response_json = json.dumps({
+            "facts": [
+                {
+                    "text": "User adopted a dog named Max",
+                    "action": "ADD",
+                    "predicate_key": "pet_name",
+                    "entities": ["Max"],
+                    "confidence": 0.98,
+                    "exact_quote": "dog named Max"
+                }
+            ]
+        })
+        extractor = LLMExtractor(_client(response_json))
+        record = ContextRecord(
+            record_id="rec:001",
+            session_id="session:001",
+            actor_role="user",
+            occurred_at=datetime.now(timezone.utc),
+            content_type="text/plain",
+            content="I just adopted a dog named Max from the shelter.",
+        )
+        drafts = extractor.extract(record)
+        self.assertEqual(len(drafts), 1)
+        self.assertEqual(drafts[0].text, "User adopted a dog named Max")
+        self.assertEqual(drafts[0].action, "ADD")
+        self.assertEqual(drafts[0].predicate_key, "pet_name")
+        self.assertEqual(drafts[0].entities[0].surface, "Max")
+        self.assertEqual(drafts[0].confidence, 0.98)
+        self.assertEqual(record.content[drafts[0].source_start:drafts[0].source_end], "dog named Max")
+
+    def test_extract_empty_or_malformed_returns_empty(self) -> None:
+        extractor = LLMExtractor(_client("{malformed json"))
+        record = ContextRecord(
+            record_id="rec:002",
+            session_id="session:001",
+            actor_role="user",
+            occurred_at=datetime.now(timezone.utc),
+            content_type="text/plain",
+            content="Hello there!",
+        )
+        drafts = extractor.extract(record)
+        self.assertEqual(drafts, ())
+
+
 if __name__ == "__main__":
     unittest.main()
