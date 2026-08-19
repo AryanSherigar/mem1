@@ -241,7 +241,7 @@ Exit criterion: temporal examples reviewed and approved before graph writes are 
 
 ### Milestone 6 — Local HydraDB Graph Write Adapter
 
-**Approval:** Approved 2026-08-17. Local HTTP adapter implemented; local runtime smoke pending.
+**Approval:** Approved 2026-08-17. Local HTTP adapter implemented; local runtime smoke passed 2026-08-19 against a Docker-built `graph-node` (ADR-032).
 
 **Goal:** Persist validated graph topology using the checked-in HydraDB server.
 
@@ -360,10 +360,10 @@ Deferral means not designed or implemented without a new decision and approval p
 | 3. Generic boundary/LongMemEval adapter/chunking | Completed — generic + live PostgreSQL tests and full-data dry run verified | Approved 2026-08-16 |
 | 4. Extraction/classification | Completed — deterministic baseline, audit persistence, and live PostgreSQL test verified | Approved 2026-08-16 |
 | 5. Entity/temporal resolution | Completed — bounded LLM decision ports, deterministic gates, and fixtures verified; real-provider hold-on closed (ADR-029, Fireworks deepseek-v4-flash, live-verified); no graph writes yet | Approved 2026-08-16 |
-| 6. HydraDB adapter | Implemented — local HTTP adapter, immutable graph manifest, deterministic tests, Docker write/read smoke | Approved 2026-08-17 |
+| 6. HydraDB adapter | Implemented and live-verified 2026-08-19 — local HTTP adapter, immutable graph manifest, deterministic tests, real write/read round trip against a Docker-built `graph-node` (ADR-032) | Approved 2026-08-17 |
 | 7. Embeddings | Implemented — `sentence-transformers` embedder + `PostgresEmbeddingStore` against the existing `memory_embeddings` pgvector table; deterministic unit suite verified | Approved 2026-08-19 |
 | 8. Recovery orchestration | Implemented — job state machine, whole-chunk idempotent replay, deterministic + real-Postgres suite verified; `SUPERSEDES` graph edges deferred (needs `predicate_key`, ADR-030) | Approved 2026-08-19 |
-| 9. End-to-end verification | Blocked: needs a real local `graph-node` instance running (none built/running in this environment) plus predicate extraction for full temporal-update coverage | Not approved |
+| 9. End-to-end verification | Partially unblocked: a real local `graph-node` is now built and live-verified (ADR-032), and `test_orchestrator_live.py` proves the full M8 pipeline against it. Still blocked on predicate extraction for full temporal-update/`SUPERSEDES` coverage (ADR-030) and a representative multi-record fixture run | Not approved |
 
 M5's real-provider hold-on (see Milestone 5 above) is now closed by ADR-027/ADR-029: `LLMEntityResolutionModel`/`LLMTemporalUpdateModel` run against Fireworks `deepseek-v4-flash`, unit-tested with an injected fake client and live-verified against the real provider (`src/tests/test_model_adapters_live.py`, opt-in, gated on a runtime-environment credential).
 

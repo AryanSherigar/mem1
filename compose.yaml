@@ -12,3 +12,71 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  # Local HydraDB graph-node (ADR-032). Profile-gated: `docker compose up` alone
+  # never builds/starts this — it's a slow multi-stage Rust build the first time
+  # and most work (anything not touching the live graph write path) doesn't need
+  # it. Start explicitly with `docker compose --profile graph up -d graph-node`.
+  #
+  # One-time setup before first start (not created automatically — a fixed dev
+  # token checked into a bind mount would be an easy thing to miss rotating):
+  #   mkdir -p .hydradb
+  #   printf '%s\n' 'local-development-token-32-bytes' > .hydradb/auth-token
+  # Graph store/cache are Docker-managed named volumes, not bind mounts (see why
+  # below); `docker compose down -v` wipes them for a clean slate.
+  graph-node:
+    profiles: ["graph"]
+    build:
+      context: ./hydradb
+      dockerfile: Dockerfile
+      target: runtime
+    image: hydradb-graph-node:local
+    ports:
+      - "127.0.0.1:7687:7687"   # Bolt
+      - "127.0.0.1:8443:8443"   # HTTP/JSON query API
+      - "127.0.0.1:9090:9090"   # admin: /readyz, metrics
+    volumes:
+      # Named volumes, not host bind mounts: graph-node's object-store backend
+      # does a conditional PUT (PutMode::Update, used for restart write-fencing)
+      # that Docker Desktop's host bind-mount passthrough on macOS does not
+      # implement — confirmed empirically, it fails only on the second start
+      # against existing state, with "PutMode::Update not yet implemented by
+      # LocalFileSystem" in the container logs. Docker-managed volumes go
+      # through the real filesystem inside the Linux VM instead and don't hit it.
+      #
+      # Mounted at /tmp/graph and /var/cache/slatedb specifically — not an
+      # arbitrary /data/... path — because the image's runtime-base stage
+      # already `chown -R graph:graph`s exactly these two directories for the
+      # non-root uid 10001 the container runs as (see hydradb/Dockerfile).
+      # Docker copies that ownership onto a fresh named volume on first mount;
+      # an arbitrary path has no such pre-chowned source and the container
+      # fails with "Permission denied" creating its writer-lease directory —
+      # also confirmed empirically, not a hypothetical.
+      - hydradb_store:/tmp/graph
+      - hydradb_cache:/var/cache/slatedb
+      - ./.hydradb/auth-token:/data/auth-token:ro
+    environment:
+      CLOUD_PROVIDER: local
+      LOCAL_PATH: /tmp/graph
+      GRAPH_NAMESPACE: default
+      GRAPH_ID: default
+      GRAPH_CELL_ID: cell-0
+      GRAPH_CELLS: cell-0
+      GRAPH_NODE_ID: node-0
+      GRAPH_BOLT_NODE_ADDRESSES: node-0=0.0.0.0:7687
+      GRAPH_ADVERTISED_BOLT_ADDR: 127.0.0.1:7687
+      GRAPH_DATA_CACHE_DIR: /var/cache/slatedb
+      GRAPH_AUTH_TOKEN_FILE: /data/auth-token
+      GRAPH_ALLOW_PLAINTEXT: "true"
+      RUST_MIN_STACK: "33554432"
+    healthcheck:
+      # No curl/wget in the runtime image (ubuntu base, intentionally minimal) —
+      # a bash /dev/tcp connect is the only dependency-free check available.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9090' || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  hydradb_store:
+  hydradb_cache:

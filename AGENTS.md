@@ -18,9 +18,9 @@ LongMemEval is the first acceptance benchmark and a source adapter. It must flow
 through the same generic ingestion contracts and orchestration as other context
 sources; it must not define core domain models or storage APIs.
 
-Milestones 0–8 are implemented; M6's local HTTP adapter has only been
-deterministic/manifest-tested in this environment, never live (no `graph-node`
-binary built/running here yet — see verification note in M6). M4 is a
+Milestones 0–8 are implemented; M6's local HTTP adapter is live-verified
+against a real `graph-node` (built via `hydradb/Dockerfile`, no native
+toolchain needed — ADR-032). M4 is a
 deterministic extraction baseline only. M5 and M7 have real provider-neutral
 adapters (`LLMClient`-backed entity/temporal models on Fireworks
 `deepseek-v4-flash`, ADR-029; `sentence-transformers` embedder) behind their
@@ -38,6 +38,9 @@ single-entry-point description of both parts.
 
 - `docs/architecture_plan.md`: single entry point for the accepted ingestion
   and retrieval design; start here.
+- `docs/implemented_agentic_memory_guide.md`: beginner-friendly explanation of
+  the implemented ingestion pipeline, graph, bitemporal model, embeddings, and
+  current limits.
 - `hydradb/`: upstream Rust graph database and its authoritative implementation
   documentation.
 - `hydradb/architecture.md`: implemented storage, consistency, indexing,
@@ -70,7 +73,8 @@ single-entry-point description of both parts.
 - `src/context_memory/client/`: local HydraDB public HTTP client boundary.
 - `src/tests/`: deterministic contract and domain validation tests.
 - `db/migrations/`: forward-only checksum-verified PostgreSQL schema changes.
-- `compose.yaml`: local PostgreSQL 16 + pgvector service. Docker daemon required.
+- `compose.yaml`: local PostgreSQL 16 + pgvector (always-on) and local
+  `graph-node` (profile-gated: `--profile graph`, ADR-032). Docker daemon required.
 
 ## Architectural Boundary
 
@@ -288,7 +292,9 @@ docker compose up -d postgres
 CONTEXT_MEMORY_TEST_DATABASE_URL=postgresql://context_memory@127.0.0.1:54329/context_memory PYTHONPATH=src .venv/bin/python -m unittest discover -s src/tests -v
 ```
 
-HydraDB live verification is locally token-gated. Supply `CONTEXT_MEMORY_HYDRADB_URL`,
+HydraDB live verification is locally token-gated. No native toolchain needed —
+build `graph-node` from the checked-in Dockerfile and run it per
+`docs/architecture_plan.md` §7 (ADR-032). Supply `CONTEXT_MEMORY_HYDRADB_URL`,
 `CONTEXT_MEMORY_HYDRADB_TOKEN`, and optional `CONTEXT_MEMORY_HYDRADB_DATABASE`
 only through runtime environment, then run:
 

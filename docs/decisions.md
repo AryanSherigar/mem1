@@ -56,6 +56,7 @@ Every material entry records why, tradeoffs, consequences, revisit triggers, and
 | ADR-029 | Fireworks + deepseek-v4-flash as the M5 model provider | Accepted | 2026-08-19 |
 | ADR-030 | Candidate-to-graph-plan mapping; SUPERSEDES deferred pending predicate_key | Accepted | 2026-08-19 |
 | ADR-031 | M8 job state machine: whole-chunk idempotent replay, not per-stage resumption | Accepted | 2026-08-19 |
+| ADR-032 | Local HydraDB graph-node built via Docker and live-verified | Accepted | 2026-08-19 |
 
 ## 3. Accepted Decisions
 
@@ -654,3 +655,29 @@ The state-transition table was generalized from the contract's single documented
 **Verification:** `src/tests/test_job_transitions.py` (11 tests, pure state-table logic, every table row plus the generalized skip-ahead/idempotent-replay rule). `src/tests/test_orchestrator.py` (6 tests, fakes only): happy path reaches `completed` and writes the expected graph/embedding shape; zero-candidate chunk still completes; a transient failure produces `retryable_failed` and a second call succeeds; a `completed` job is never reprocessed; a `terminal_failed` job blocks auto-retry. `PostgresJobStore` verified against real PostgreSQL: lifecycle to `completed`, `seed` idempotency (does not reset progress), illegal-transition rejection, `attempt_count` increment on failure.
 
 **Revisit trigger:** Retry cost (re-running extraction/graph-write/embeddings on every retry) is measured and found too expensive, motivating `ExtractionStore`/`EmbeddingStore` read-back ports and true per-stage resumption as a follow-up ADR.
+
+### ADR-032 — Local HydraDB Graph-Node Built via Docker and Live-Verified
+
+**Status:** Accepted
+**Date:** 2026-08-19
+
+**Decision:** Build `graph-node` from `hydradb/Dockerfile`'s `runtime` target (`docker build --target runtime -t hydradb-graph-node:local hydradb/`) instead of a native `cargo build` — this environment has neither the Rust toolchain nor `just`/`libcypher-parser`/GraphBLAS installed, all of which the Dockerfile's `build-base` stage installs for you. Run it single-node, local-object-store, plaintext, exactly per `hydradb/README.md`'s "Run a local server" recipe, translated to `docker run` with the same env vars and ports 7687 (Bolt)/8443 (HTTP)/9090 (admin) mapped to `127.0.0.1`. State lives in `.hydradb/` (gitignored).
+
+**Why:** ADR-021's and ADR-024's own verification sections said live verification was waiting on a user-provided runtime URI/token; every prior session left `test_hydradb_live.py` skipped. This closes that, using the exact build path the maintainers themselves ship for people without the native toolchain.
+
+**Consequences:** `tests/test_hydradb_live.py` (previously always skipped in this environment) now passes for real. New `tests/test_orchestrator_live.py`: the full M8 pipeline — `IngestionOrchestrator` with real `PostgresChunkStore`/`PostgresJobStore`/`PostgresEmbeddingStore`, a real `sentence-transformers` embedder, and a real `HydraHttpTransport` against this node — reaches `completed`, then is independently re-read straight from HydraDB (not same-process evidence, unlike the fake-backed orchestrator tests) to confirm the entity actually landed in the graph. No LLM provider needed for this test: entity resolution here only needed exact/new-entity matching.
+
+**Tradeoffs / hold-ons:** This is one plaintext, single-node, local-object-store instance — nothing about clustering, TLS, MinIO/S3 backing, or multi-node placement has been exercised. The container isn't part of `compose.yaml` (only Postgres is); anyone reproducing this needs to build the image and run it by hand per this ADR, or `compose.yaml` should gain a service for it as follow-up work.
+
+**Verification:** `curl` write+read round trip matching the README's own documented expected output exactly (`{"type":"vertex_id","value":2}`). `src/tests/test_hydradb_live.py` (1 test) and `src/tests/test_orchestrator_live.py` (1 test) both pass against the running container. Full suite with Postgres + this node + the Fireworks credential all present: 115 tests, 1 skipped (the separately-opt-in embedding-model-download smoke test), 0 failures.
+
+**Revisit trigger:** `compose.yaml` gains a `graph-node` service so this is reproducible with one `docker compose up` instead of a hand-built image; or a real multi-node/TLS/MinIO configuration is needed for a later milestone.
+
+**Addendum, 2026-08-19 — `compose.yaml` service added, two real bugs found closing the revisit trigger above:**
+
+`graph-node` is now a `compose.yaml` service, gated behind the `graph` Compose profile (`docker compose --profile graph up -d graph-node`) so plain `docker compose up` — most work only needs Postgres — never triggers its multi-stage Rust build. Two genuine, empirically-found problems came up productionizing the manual setup into a restartable service, neither hypothetical:
+
+1. **Host bind mounts break on restart.** The original service mounted `./.hydradb/store` directly (matching the manual setup this ADR started with). First start: fine. Stop, then start again against the same data: every write failed with `object store error: Operation \`put_opts\` with mode \`PutMode::Update\` not yet implemented by LocalFileSystem(file:///data/store)`. graph-node's object-store layer does a conditional PUT for restart write-fencing that Docker Desktop's macOS bind-mount passthrough doesn't support. Fix: Docker-managed named volumes (`hydradb_store`, `hydradb_cache`) instead of host bind mounts — these go through the real filesystem inside Docker Desktop's Linux VM and don't hit the gap.
+2. **Named volumes at an arbitrary path fail on the non-root container user.** Mounting the new named volumes at an arbitrary `/data/store`/`/data/cache` failed differently: `Permission denied (os error 13)` creating the writer-lease directory. The runtime image runs as uid 10001 (`graph`), and only `chown -R graph:graph`s two specific paths at build time — `/tmp/graph` and `/var/cache/slatedb` (see `hydradb/Dockerfile`'s `runtime-base` stage). A fresh named volume mounted at a path Docker has never seen starts out root-owned; mounted at a path the image already prepared, Docker copies that path's existing ownership onto the new volume. Fix: mount `hydradb_store`/`hydradb_cache` at exactly `/tmp/graph`/`/var/cache/slatedb`, not an invented path.
+
+Both confirmed by actually stopping and restarting the Compose-managed container and re-running the same write/read round trip plus the full test suite (115 tests, 0 failures) against it — not just a first successful start.
