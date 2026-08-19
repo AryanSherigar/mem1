@@ -223,6 +223,12 @@ def main() -> int:
 
     print(f"Connecting to PostgreSQL at {args.database_url}...")
     with psycopg.connect(args.database_url, autocommit=True) as pg_conn:
+        from pathlib import Path
+        from context_memory.persistence.migrations import apply_migrations
+        migrations_dir = Path(__file__).resolve().parents[2] / "db" / "migrations"
+        if migrations_dir.exists():
+            apply_migrations(pg_conn, migrations_dir)
+
         hydra_client = HydraHttpTransport(
             base_url=args.hydradb_url,
             bearer_token=args.hydradb_token or None,

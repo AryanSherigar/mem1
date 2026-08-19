@@ -20,11 +20,24 @@ HttpRequester = Callable[[str, str, Mapping[str, str], bytes], Mapping[str, obje
 
 
 class HydraHttpTransport:
-    def __init__(self, base_url: str, auth_token: str, *, namespace: str = "default", graph_id: str = "default", cell_id: str = "cell-0", requester: HttpRequester | None = None) -> None:
-        if not base_url.startswith(("http://", "https://")) or not auth_token or not namespace or not graph_id or not cell_id:
+    def __init__(
+        self,
+        base_url: str,
+        auth_token: str | None = None,
+        *,
+        bearer_token: str | None = None,
+        namespace: str = "default",
+        graph_id: str = "default",
+        database: str | None = None,
+        cell_id: str = "cell-0",
+        requester: HttpRequester | None = None,
+    ) -> None:
+        token = auth_token or bearer_token or "context-memory-local-smoke-token-32b"
+        effective_graph_id = database if database is not None else graph_id
+        if not base_url.startswith(("http://", "https://")) or not token or not namespace or not effective_graph_id or not cell_id:
             raise ValueError("base_url, auth token, namespace, graph_id, and cell_id must be non-empty")
-        self._url = f"{base_url.rstrip('/')}/v1/graphs/{graph_id}/query"
-        self._headers = {"Authorization": f"Bearer {auth_token}", "X-Graph-Namespace": namespace, "Content-Type": "application/json", "Accept": "application/json"}
+        self._url = f"{base_url.rstrip('/')}/v1/graphs/{effective_graph_id}/query"
+        self._headers = {"Authorization": f"Bearer {token}", "X-Graph-Namespace": namespace, "Content-Type": "application/json", "Accept": "application/json"}
         self._cell_id, self._requester = cell_id, requester or _request_json
 
     def write(self, cypher: str, rows: Sequence[dict[str, object]], idempotency_key: str) -> str | None:

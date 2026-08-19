@@ -39,7 +39,7 @@ def get_engine() -> MemoryEngine:
     hydra_url = os.environ.get("CONTEXT_MEMORY_HYDRADB_URL", os.environ.get("HYDRA_DB_HOST", "http://127.0.0.1:8080"))
     if not hydra_url.startswith("http://") and not hydra_url.startswith("https://"):
         hydra_url = f"http://{hydra_url}"
-    hydra_token = os.environ.get("CONTEXT_MEMORY_HYDRADB_TOKEN", os.environ.get("HYDRA_DB_API_KEY", ""))
+    hydra_token = os.environ.get("CONTEXT_MEMORY_HYDRADB_TOKEN", os.environ.get("HYDRA_DB_API_KEY", "context-memory-local-smoke-token-32b"))
     hydra_db = os.environ.get("CONTEXT_MEMORY_HYDRADB_DATABASE", os.environ.get("HYDRA_DB_GRAPH_ID", "default"))
 
     llm_base_url = os.environ.get("FIREWORKS_BASE_URL", os.environ.get("OPENAI_BASE_URL", "https://api.fireworks.ai/inference/v1"))
@@ -47,7 +47,14 @@ def get_engine() -> MemoryEngine:
     llm_model = os.environ.get("EXTRACTOR_MODEL", "accounts/fireworks/models/deepseek-v4-flash-0731")
 
     import psycopg
+    from pathlib import Path
+    from context_memory.persistence.migrations import apply_migrations
+
     pg_conn = psycopg.connect(db_url, autocommit=True)
+    migrations_dir = Path(__file__).resolve().parents[2] / "db" / "migrations"
+    if migrations_dir.exists():
+        apply_migrations(pg_conn, migrations_dir)
+
     hydra_transport = HydraHttpTransport(base_url=hydra_url, bearer_token=hydra_token or None, database=hydra_db)
     llm_client = LLMClient(base_url=llm_base_url, api_key=llm_api_key, model_name=llm_model)
     embedder = SentenceTransformerEmbedder()

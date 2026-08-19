@@ -20,13 +20,15 @@ class HydrationManager:
         self,
         pg_connection: object,
         hydra_client: HydraHttpTransport,
-        embedding_index: EmbeddingIndex,
-        entity_name_index: EntityNameIndex
+        embedding_index: EmbeddingIndex | None = None,
+        entity_name_index: EntityNameIndex | None = None,
+        embedder: object | None = None,
     ) -> None:
         self._pg = pg_connection
         self._hydra = hydra_client
-        self._embedding_index = embedding_index
-        self._entity_name_index = entity_name_index
+        self._embedding_index = embedding_index if embedding_index is not None else EmbeddingIndex()
+        self._entity_name_index = entity_name_index if entity_name_index is not None else EntityNameIndex()
+        self._embedder = embedder
 
     def hydrate_context(self, context_id: str) -> None:
         """Loads all active facts and entities for a given context into the indexes."""

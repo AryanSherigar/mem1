@@ -17,9 +17,10 @@ from context_memory.core.resolution import (
 from db.embedding_index import EntityNameIndex
 
 class EntityRegistry:
-    def __init__(self, allocator: GraphIdAllocator, name_index: EntityNameIndex | None = None) -> None:
+    def __init__(self, allocator: GraphIdAllocator, name_index: EntityNameIndex | None = None, model: EntityResolutionModel | None = None) -> None:
         self._allocator = allocator
         self._name_index = name_index
+        self._model = model
         self._profiles: dict[int, EntityProfile] = {}
 
     def register(self, profile: EntityProfile) -> None:
@@ -42,6 +43,7 @@ class EntityRegistry:
         candidate_ids: Iterable[int] = (),
         model: EntityResolutionModel | None = None,
     ) -> EntityResolution:
+        effective_model = model if model is not None else self._model
         # Fetch dynamic candidates from Tier-2 Cache if available
         candidate_ids = list(candidate_ids)
         if self._name_index and not candidate_ids:
@@ -68,9 +70,9 @@ class EntityRegistry:
             if profile is not None and profile.context_id == context_id:
                 shortlist[graph_id] = profile
         if shortlist:
-            if model is None:
+            if effective_model is None:
                 return EntityResolution(ResolutionStatus.UNRESOLVED, None, "ambiguous candidate set requires model")
-            selected_id = model.resolve_entity(context_id=context_id, surface=surface, candidates=tuple(shortlist.values()))
+            selected_id = effective_model.resolve_entity(context_id=context_id, surface=surface, candidates=tuple(shortlist.values()))
             selected = shortlist.get(selected_id) if selected_id is not None else None
             if selected is None:
                 return EntityResolution(ResolutionStatus.UNRESOLVED, None, "model abstained or selected outside bounded candidates")

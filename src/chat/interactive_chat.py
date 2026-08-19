@@ -53,9 +53,23 @@ class InteractiveChat(cmd.Cmd):
         self.context_id = arg
         print(f"Switched context to: {self.context_id}")
 
+    def default(self, line: str):
+        """Default handler routes any input without a command prefix directly to chat."""
+        if line.strip():
+            self.do_chat(line)
+
     def do_exit(self, arg):
         """Exit the chat interface."""
         print("Goodbye!")
+        return True
+
+    def do_quit(self, arg):
+        """quit: Exit the chat interface."""
+        return self.do_exit(arg)
+
+    def do_EOF(self, arg):
+        """Exit on EOF (Ctrl+D)."""
+        print("\nGoodbye!")
         return True
 
 def main():

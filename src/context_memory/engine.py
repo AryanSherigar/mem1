@@ -28,7 +28,7 @@ class MemoryEngine:
         self._retrieval_engine = retrieval_engine
         self._llm = llm_client
         self._pg = pg_connection
-        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._executor = ThreadPoolExecutor(max_workers=1)
         self._hydration_manager = hydration_manager
 
     def add_turn_async(self, context_id: str, session_id: str, role: str, content: str, timestamp: datetime) -> None:
