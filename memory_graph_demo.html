@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HydraDB Real-time Memory Graph</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #050507;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: sans-serif;
+  }
+  .card {
+    background: #0a0a0f;
+    border-radius: 16px;
+    padding: 16px;
+    width: 680px;
+    max-width: 92vw;
+    box-sizing: border-box;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+    padding: 0 4px;
+  }
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  #pulse-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #5DCAA5;
+    box-shadow: 0 0 8px #5DCAA5;
+  }
+  .label {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 10px;
+    color: #9a9aa5;
+    letter-spacing: 0.5px;
+  }
+  #node-count {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 9px;
+    color: #6a6a75;
+  }
+  canvas {
+    width: 100%;
+    height: 460px;
+    display: block;
+    border-radius: 12px;
+    background: #050507;
+  }
+  .footer {
+    display: flex;
+    justify-content: center;
+    gap: 6px;
+    margin-top: 12px;
+  }
+  #restart-btn {
+    background: rgba(255,255,255,0.06);
+    border: 0.5px solid rgba(255,255,255,0.12);
+    color: #cfcfd8;
+    font-family: 'Press Start 2P', monospace;
+    font-size: 9px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  #restart-btn:hover {
+    background: rgba(255,255,255,0.1);
+  }
+  @keyframes flash {
+    0% { box-shadow: 0 0 8px #5DCAA5; }
+    50% { box-shadow: 0 0 16px 4px #5DCAA5; }
+    100% { box-shadow: 0 0 8px #5DCAA5; }
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="header">
+    <div class="header-left">
+      <div id="pulse-dot"></div>
+      <span class="label">HYDRADB GRAPH</span>
+    </div>
+    <span id="node-count">0</span>
+  </div>
+  <canvas id="graph-canvas"></canvas>
+  <div class="footer">
+    <button id="restart-btn">RESTART SIMULATION</button>
+  </div>
+</div>
+
+<script>
+/**
+ * HydraDB Live Memory Graph UI
+ * 
+ * This component is built to visualize the HydraDB memory state in real-time.
+ * It provides a self-contained physics simulation for nodes and edges.
+ * 
+ * To wire this up to HydraDB later:
+ * 1. Remove or disable the `scheduleSpawn()` mock loop.
+ * 2. When a new entity is ingested from HydraDB, call `GraphSystem.addNode(id, label, category)`
+ * 3. When a new relationship is formed, call `GraphSystem.addEdge(sourceId, targetId)`
+ */
+const GraphSystem = (function() {
+  const canvas = document.getElementById('graph-canvas');
+  const ctx = canvas.getContext('2d');
+  const countEl = document.getElementById('node-count');
+  const pulseDot = document.getElementById('pulse-dot');
+
+  // Cohesive category color palette
+  const categories = {
+    entity:     { color: '#7F77DD', glow: 'rgba(127,119,221,0.55)' },
+    topic:      { color: '#1D9E75', glow: 'rgba(29,158,117,0.55)' },
+    event:      { color: '#D85A30', glow: 'rgba(216,90,48,0.55)' },
+    preference: { color: '#D4537E', glow: 'rgba(212,83,126,0.55)' }
+  };
+
+  let nodes = [];
+  let edges = [];
+  let animId = null;
+  let W = 0, H = 0;
+  let fontReady = false;
+
+  function resize() {
+    const rect = canvas.getBoundingClientRect();
+    W = rect.width; H = rect.height;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function addNode(id, label, cat) {
+    if (nodes.some(n => n.id === id)) return; // prevent duplicates
+
+    // Fallback category if unknown
+    if (!categories[cat]) cat = 'entity';
+
+    const angle = Math.random() * Math.PI * 2;
+    const dist = 40 + Math.random() * 20;
+    const cx = W / 2, cy = H / 2;
+    
+    const node = {
+      id,
+      label, 
+      cat,
+      x: cx + Math.cos(angle) * dist,
+      y: cy + Math.sin(angle) * dist,
+      vx: 0, vy: 0,
+      r: 0, targetR: 7 + Math.random() * 3,
+      born: performance.now(),
+      alpha: 0
+    };
+    nodes.push(node);
+
+    // Update UI indicators
+    countEl.textContent = nodes.length;
+    pulseDot.style.animation = 'none';
+    void pulseDot.offsetWidth; // trigger reflow
+    pulseDot.style.animation = 'flash 0.5s ease';
+
+    return node;
+  }
+
+  function addEdge(sourceId, targetId) {
+    const a = nodes.find(n => n.id === sourceId);
+    const b = nodes.find(n => n.id === targetId);
+    if (!a || !b) return;
+
+    // Prevent duplicate edges
+    const exists = edges.some(e => (e.a === a && e.b === b) || (e.a === b && e.b === a));
+    if (!exists) {
+      edges.push({ a, b, born: performance.now(), alpha: 0 });
+    }
+  }
+
+  function step() {
+    const now = performance.now();
+    const cx = W / 2, cy = H / 2;
+
+    // 1. Update Nodes (Physics & Animations)
+    for (const n of nodes) {
+      const age = now - n.born;
+      // Fade in alpha
+      n.alpha = Math.min(1, age / 400);
+      // Ease-out scale pop
+      const spring = 1 - Math.pow(1 - Math.min(1, age / 500), 3);
+      n.r = n.targetR * spring;
+
+      let fx = 0, fy = 0;
+      
+      // Weak centering force
+      fx += (cx - n.x) * 0.0009;
+      fy += (cy - n.y) * 0.0009;
+
+      // Node Repulsion
+      for (const o of nodes) {
+        if (o === n) continue;
+        const dx = n.x - o.x, dy = n.y - o.y;
+        const d2 = dx * dx + dy * dy + 0.01;
+        const d = Math.sqrt(d2);
+        if (d < 90) {
+          const f = (90 - d) / d * 0.06;
+          fx += dx * f; fy += dy * f;
+        }
+      }
+
+      n.vx = (n.vx + fx) * 0.9; // Apply force and friction
+      n.vy = (n.vy + fy) * 0.9;
+      n.x += n.vx;
+      n.y += n.vy;
+    }
+
+    // 2. Update Edges (Spring Forces & Animations)
+    for (const e of edges) {
+      const dx = e.b.x - e.a.x, dy = e.b.y - e.a.y;
+      const d = Math.sqrt(dx * dx + dy * dy) || 1;
+      const targetLen = 90;
+      const f = (d - targetLen) * 0.002;
+      const fx = (dx / d) * f, fy = (dy / d) * f;
+      
+      e.a.vx += fx; e.a.vy += fy;
+      e.b.vx -= fx; e.b.vy -= fy;
+      
+      // Fade in edge
+      e.alpha = Math.min(1, (now - e.born) / 500);
+    }
+
+    // 3. Render
+    ctx.clearRect(0, 0, W, H);
+
+    // Draw Edges
+    for (const e of edges) {
+      const grad = ctx.createLinearGradient(e.a.x, e.a.y, e.b.x, e.b.y);
+      grad.addColorStop(0, categories[e.a.cat].color);
+      grad.addColorStop(1, categories[e.b.cat].color);
+      
+      ctx.strokeStyle = grad;
+      ctx.globalAlpha = e.alpha * 0.35;
+      ctx.lineWidth = 1.5;
+      
+      // Control point for quadratic curve to make slight curve
+      const mx = (e.a.x + e.b.x) / 2 + (e.a.y - e.b.y) * 0.06;
+      const my = (e.a.y + e.b.y) / 2 + (e.b.x - e.a.x) * 0.06;
+      
+      ctx.beginPath();
+      ctx.moveTo(e.a.x, e.a.y);
+      ctx.quadraticCurveTo(mx, my, e.b.x, e.b.y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // Draw Nodes
+    for (const n of nodes) {
+      const c = categories[n.cat];
+      ctx.save();
+      ctx.globalAlpha = n.alpha;
+      
+      // Glow effect
+      ctx.shadowColor = c.glow;
+      ctx.shadowBlur = 16;
+      
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+      ctx.fillStyle = c.color;
+      ctx.fill();
+      ctx.restore();
+
+      // Draw Labels (delay fade in until node is mostly spawned)
+      if (n.alpha > 0.6 && fontReady) {
+        ctx.save();
+        ctx.globalAlpha = (n.alpha - 0.6) / 0.4; // Fade from 0 to 1 over the last 40% of node spawn
+        ctx.font = '9px "Press Start 2P", monospace';
+        ctx.fillStyle = '#c8c8d2';
+        ctx.textAlign = 'center';
+        ctx.fillText(n.label, n.x, n.y + n.r + 18);
+        ctx.restore();
+      }
+    }
+
+    animId = requestAnimationFrame(step);
+  }
+
+  function init() {
+    resize();
+    window.addEventListener('resize', resize);
+    
+    // Load font
+    if (document.fonts && document.fonts.load) {
+      document.fonts.load('9px "Press Start 2P"').then(() => fontReady = true).catch(() => fontReady = true);
+      setTimeout(() => fontReady = true, 800);
+    } else {
+      fontReady = true;
+    }
+
+    step();
+  }
+
+  function reset() {
+    nodes = [];
+    edges = [];
+    countEl.textContent = '0';
+  }
+
+  // Auto-init on load
+  init();
+
+  return {
+    addNode,
+    addEdge,
+    reset,
+    getNodes: () => nodes
+  };
+})();
+
+// ============================================================================
+// REAL-TIME SSE DATA FEED FROM HYDRADB
+// ============================================================================
+(function() {
+  let eventSource = null;
+
+  function connectStream() {
+    if (eventSource) {
+      eventSource.close();
+    }
+    GraphSystem.reset();
+    
+    // Connect to the backend stream
+    // Using relative path assuming it's served by the same host,
+    // or fallback to localhost:8000 for local dev
+    const streamUrl = window.location.port === '8000' 
+      ? '/v1/memory/stream' 
+      : 'http://localhost:8000/v1/memory/stream';
+      
+    eventSource = new EventSource(streamUrl);
+
+    eventSource.onmessage = function(event) {
+      if (event.data === 'keepalive') return;
+
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload.type === 'graph_update') {
+          // Process Nodes
+          for (const node of payload.nodes) {
+            let labelText = node.properties.name || node.properties.content || node.label;
+            // Truncate long text strings
+            if (labelText && labelText.length > 20) {
+              labelText = labelText.substring(0, 18) + '..';
+            }
+            
+            let cat = 'entity';
+            if (node.label === 'Fact') cat = 'topic';
+            else if (node.label === 'Turn') cat = 'event';
+            else if (node.label === 'Alias') cat = 'preference';
+
+            GraphSystem.addNode(node.id, labelText.toUpperCase(), cat);
+          }
+          
+          // Process Edges
+          for (const edge of payload.edges) {
+            // Slight delay so nodes pop in first
+            setTimeout(() => {
+              GraphSystem.addEdge(edge.source_id, edge.target_id);
+            }, 300);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to parse SSE payload", err);
+      }
+    };
+
+    eventSource.onerror = function(err) {
+      console.error("SSE EventSource failed", err);
+      eventSource.close();
+      // Reconnect after 5 seconds
+      setTimeout(connectStream, 5000);
+    };
+  }
+
+  document.getElementById('restart-btn').addEventListener('click', connectStream);
+  
+  // Start connection
+  connectStream();
+})();
+</script>
+
+</body>
+</html>

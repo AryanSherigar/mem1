@@ -105,8 +105,8 @@ flowchart TD
 
 ### Requirements
 - **Python 3.12+**
-- **Docker & Docker Compose** (for PostgreSQL + pgvector)
-- **Groq**, **Fireworks**, or **OpenAI** API key (for live LLM extraction & synthesis)
+- **Docker & Docker Compose** (for PostgreSQL + pgvector and HydraDB Graph Node)
+- **Groq**, **Fireworks AI**, or **OpenAI** API key (for live LLM extraction & synthesis)
 
 ### 1. Environment Setup
 
@@ -123,36 +123,38 @@ pip install -e .
 
 ### 2. Configuration (`.env`)
 
-Create a `.env` file in the root directory (or export variables directly into your shell):
+Export your environment variables or place them in a `.env` file:
 
 ```bash
-# --- LLM Provider Settings (Groq Example) ---
-export GROQ_API_KEY="gsk_your_groq_api_key"
-export GROQ_BASE_URL="https://api.groq.com/openai/v1"
+# --- Option A: Groq (e.g. using openai/gpt-oss-20b or llama-3.3-70b-versatile) ---
+export OPENAI_API_KEY="gsk_your_groq_api_key"
+export OPENAI_BASE_URL="https://api.groq.com/openai/v1"
 export EXTRACTOR_MODEL="openai/gpt-oss-20b"
 export READER_MODEL="openai/gpt-oss-20b"
 
-# --- Alternatively: Fireworks AI Example ---
+# --- Option B: Fireworks AI (e.g. using deepseek-v4-flash-0731) ---
 # export FIREWORKS_API_KEY="your_fireworks_api_key"
 # export FIREWORKS_BASE_URL="https://api.fireworks.ai/inference/v1"
 # export EXTRACTOR_MODEL="accounts/fireworks/models/deepseek-v4-flash-0731"
+# export READER_MODEL="accounts/fireworks/models/deepseek-v4-flash-0731"
 
-# --- Storage Layer Settings ---
+# --- Storage Layer Settings (Pre-configured for local Docker Compose) ---
 export DATABASE_URL="postgresql://context_memory:context_memory@127.0.0.1:54329/context_memory"
 export CONTEXT_MEMORY_HYDRADB_URL="http://127.0.0.1:8080"
-export CONTEXT_MEMORY_HYDRADB_TOKEN="local-dev-token"
+export CONTEXT_MEMORY_HYDRADB_TOKEN="context-memory-local-smoke-token-32b"
 export CONTEXT_MEMORY_HYDRADB_DATABASE="default"
 ```
 
-### 3. Start PostgreSQL + pgvector
+### 3. Start PostgreSQL + pgvector & HydraDB
 
-Start the preconfigured PostgreSQL 16 + pgvector container using Docker Compose:
+Start the preconfigured PostgreSQL 16 (pgvector) and HydraDB services using Docker Compose:
 
 ```bash
-docker compose up -d postgres
+docker compose up -d
 ```
 
-The database includes automatic migrations in `db/migrations/` creating all required tables (`evidence_chunks`, `ingestion_jobs`, `graph_id_registry`, `memory_embeddings`, `fact_search_index`, `conversation_buffer`).
+- **PostgreSQL**: Runs on `127.0.0.1:54329` with pgvector. Migrations in `db/migrations/` run automatically on application startup.
+- **HydraDB Graph Node**: Runs on HTTP `127.0.0.1:8080` (readyz probe on `9090`, Bolt on `7687`).
 
 ---
 

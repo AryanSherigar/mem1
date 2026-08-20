@@ -2,6 +2,7 @@ README.md
 pyproject.toml
 src/api/routes.py
 src/api/server.py
+src/api/stream.py
 src/api/test-server.py
 src/api/test_server.py
 src/chat/interactive_chat.py
