@@ -10,10 +10,24 @@ between them — one `Chunk` + its accepted `ExtractedMemoryCandidate`s become
 Emits `SUPERSEDES` when the caller supplies both `update_classifier` and
 `find_existing_facts` (optional constructor-time/call-time args) — closing
 the gap ADR-030 originally left open once `ExtractedMemoryCandidate` gained
-`action`/`predicate_key` fields. Still not wired to a real data source in
-production: no caller currently constructs a real `find_existing_facts`
-(query "active facts for this subject+predicate"), only test fakes do, so
-the mechanism is code-complete but inert until one exists.
+`action`/`predicate_key` fields. Now wired to a real data source in
+production (`ingestion/fact_lookup.py`'s `HydraFactLookup`, constructed by
+both `api/routes.py` and `evaluation/benchmark_runner.py`).
+
+The existing-facts check runs for `ADD` candidates too, not only `UPDATE` —
+confirmed live: `LLMExtractor.extract()` sees only the current turn's text
+(no prior-facts context), so it has no real basis to say UPDATE vs ADD except
+guessing from phrasing, and it guessed ADD on "Max moved to Seattle." after
+"Max lives in Boston." in the same context. Trusting that guess as the sole
+gate would make SUPERSEDES fire only when the extractor happens to phrase
+things as a correction. `find_existing_facts` + `update_classifier` already
+exist specifically to make this judgment correctly (including returning
+NO_UPDATE when nothing should actually supersede), so they are the real
+arbiter; `action` no longer gates whether they get asked, only `DELETE` is
+excluded (separate semantics, not implemented here). Cost is bounded: a
+classify() call only happens when `find_existing_facts` actually returns a
+same-subject/same-predicate collision — an unrelated ADD with a fresh
+predicate touches nothing beyond the lookup itself.
 
 Every node also carries its `logical_key` as an actual graph property (not
 just the Python-side manifest/registry bookkeeping field) — `retrieval.py`'s
@@ -113,7 +127,7 @@ class GraphPlanBuilder:
                     nodes[alias_node.graph_id] = alias_node
                     relationships[has_alias.graph_id] = has_alias
 
-            if candidate.action == "UPDATE" and candidate.predicate_key and subject_entity_node and update_classifier and find_existing_facts:
+            if candidate.action != "DELETE" and candidate.predicate_key and subject_entity_node and update_classifier and find_existing_facts:
                 new_fact_state = FactState(
                     fact_id=candidate.candidate_id,
                     subject_entity_id=subject_entity_node.graph_id,
@@ -248,6 +262,11 @@ class GraphPlanBuilder:
             memory_type=candidate.memory_type.value,
             scope_type=candidate.scope_type.value,
             scope_id=candidate.scope_id,
+            # Written so `find_existing_facts` implementations can query "active
+            # facts for this subject+predicate" directly off the graph — without
+            # it, that lookup (the data source SUPERSEDES needs, see this
+            # module's docstring) has nothing to filter on.
+            predicate_key=candidate.predicate_key,
             source_chunk_id=chunk.chunk_id,
             source_start=candidate.source_span.source_start,
             source_end=candidate.source_span.source_end,

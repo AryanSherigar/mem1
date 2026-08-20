@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from context_memory.client.hydradb_http import HydraHttpTransport
+from context_memory.core.config import Config
 from context_memory.core.llm_client import LLMClient
 from context_memory.ingestion.embedding import SentenceTransformerEmbedder
 from context_memory.ingestion.extraction import ExtractionService
@@ -111,13 +112,13 @@ class PrefetchingExtractor:
         return self._inner.extract(record)
 
 
-def _report_rate_limits(llm_client: LLMClient) -> None:
-    """Prints the provider's advertised rate limits up front.
+def _report_rate_limits(llm_client: LLMClient) -> int | None:
+    """Prints the provider's advertised rate limits up front and returns the
+    tokens-per-minute limit (or None if unavailable/unparseable).
 
     A tokens-per-minute ceiling, not per-call latency, is what actually bounds
-    throughput here (measured: Groq's free tier advertises 8k TPM, which caps
-    extraction at roughly 8-9 calls/min no matter how many workers are used).
-    The SDK swallows the resulting 429s as backoff, so without this the run just
+    throughput here (measured live: Groq's free tier advertises 8k TPM). The
+    SDK swallows the resulting 429s as backoff, so without this the run just
     looks mysteriously slow. Best-effort only — never fails the run.
     """
     try:
@@ -131,7 +132,7 @@ def _report_rate_limits(llm_client: LLMClient) -> None:
         headers = raw.headers
         limits = {k: v for k, v in headers.items() if "ratelimit" in k.lower()}
         if not limits:
-            return
+            return None
         tpm = limits.get("x-ratelimit-limit-tokens")
         rpm = limits.get("x-ratelimit-limit-requests")
         print(f"Provider rate limits: {tpm} tokens/min, {rpm} requests/min")
@@ -142,8 +143,11 @@ def _report_rate_limits(llm_client: LLMClient) -> None:
                 f"  -> optimistic ceiling ~{int(tpm) // 860} extraction calls/min"
                 f" (real turns are longer, so expect fewer)"
             )
+            return int(tpm)
+        return None
     except Exception as exc:
         print(f"  (could not read provider rate limits: {type(exc).__name__})", file=sys.stderr)
+        return None
 
 
 def create_pipeline(
@@ -180,14 +184,26 @@ def create_pipeline(
         )
 
     extraction_service = ExtractionService(extractor, ext_store)
-    entity_registry = EntityRegistry(allocator=chunk_store, model=None)
+    # NOTE: was `model=None` (LLM entity resolution disabled) — that made this
+    # runner measure a materially weaker system than production: "Max" and
+    # "my dog" would never resolve to the same entity, only exact
+    # canonical/alias string matches would. `routes.py::get_engine()` always
+    # passes a real model; this runner should match, or benchmark numbers
+    # don't reflect what actually ships. Costs one extra LLM call only when a
+    # surface form is genuinely ambiguous (see `EntityRegistry.resolve`) — an
+    # exact canonical/alias match still short-circuits before ever reaching it.
+    from context_memory.ingestion.model_adapters import LLMEntityResolutionModel
+    entity_resolution_model = LLMEntityResolutionModel(llm_client)
+    entity_registry = EntityRegistry(allocator=chunk_store, model=entity_resolution_model)
     plan_builder = GraphPlanBuilder(allocator=chunk_store)
     graph_writer = GraphWriter(manifest_store=manifest_store, transport=hydra_transport)
 
     from context_memory.ingestion.model_adapters import LLMTemporalUpdateModel
     from context_memory.ingestion.resolution import TemporalUpdateClassifier
+    from context_memory.ingestion.fact_lookup import HydraFactLookup
     temporal_model = LLMTemporalUpdateModel(llm_client)
     update_classifier = TemporalUpdateClassifier(temporal_model)
+    fact_lookup = HydraFactLookup(hydra_transport)
 
     orchestrator = IngestionOrchestrator(
         chunk_store=chunk_store,
@@ -200,6 +216,7 @@ def create_pipeline(
         embedding_store=embedding_store,
         search_index_store=search_index_store,
         update_classifier=update_classifier,
+        find_existing_facts=fact_lookup.find_existing,
     )
 
     retrieval_engine = HybridRetrievalEngine(
@@ -392,9 +409,17 @@ def main() -> int:
 
     import psycopg
 
-    llm_base_url = os.environ.get("FIREWORKS_BASE_URL", os.environ.get("OPENAI_BASE_URL", "https://api.fireworks.ai/inference/v1"))
-    llm_api_key = os.environ.get("FIREWORKS_API_KEY", os.environ.get("OPENAI_API_KEY", "fake-key"))
-    llm_model = os.environ.get("EXTRACTOR_MODEL", "accounts/fireworks/models/deepseek-v4-flash-0731")
+    # Built from Config, not ad-hoc env parsing. This function used to read
+    # FIREWORKS_BASE_URL/FIREWORKS_API_KEY/EXTRACTOR_MODEL directly, which
+    # predates the provider-neutral LLM_BASE_URL/LLM_API_KEY/LLM_MODEL names
+    # in Config -- confirmed live, this was a real bug, not a hypothetical:
+    # every "Groq"/"qwen" pilot run through this CLI during the provider
+    # switch actually sent `model=accounts/fireworks/models/deepseek-v4-flash`
+    # to Fireworks, because this parsing was never updated to match. Config is
+    # the single source of truth for exactly this reason; a second copy of the
+    # same resolution logic is how it drifted out of sync in the first place.
+    config = Config()
+    llm_client = config.get_extractor_client()
 
     print(f"Connecting to PostgreSQL at {args.database_url}...")
     with psycopg.connect(args.database_url, autocommit=True) as pg_conn:
@@ -408,16 +433,33 @@ def main() -> int:
             base_url=args.hydradb_url,
             bearer_token=args.hydradb_token or None,
             database=args.hydradb_database,
+            timeout_seconds=config.hydradb_request_timeout_seconds,
         )
-        llm_client = LLMClient(base_url=llm_base_url, api_key=llm_api_key, model_name=llm_model)
-        embedder = SentenceTransformerEmbedder()
+        embedder = SentenceTransformerEmbedder(model_name=config.embedding_model_name)
 
         if args.extractor == "deterministic":
             from context_memory.ingestion.fakes import DeterministicExtractor
             extractor_impl = DeterministicExtractor()
         else:
             from context_memory.ingestion.model_adapters import LLMExtractor
-            extractor_impl = LLMExtractor(llm_client)
+            extractor_impl = LLMExtractor(llm_client, config)
+
+        tpm = _report_rate_limits(llm_client)
+        if tpm is not None and args.extraction_workers > 0:
+            # More workers than the token budget can actually feed doesn't buy
+            # throughput -- measured live: 4 workers still degraded from 63 to
+            # 43 calls/min over one run as the SDK absorbed 429s, because the
+            # ceiling is tokens/min, not concurrent connections. 2000 tokens
+            # per worker is a deliberately conservative per-worker share (real
+            # extraction calls ran ~660-1500 prompt tokens in this session);
+            # this only ever lowers --extraction-workers, never raises it.
+            safe_workers = max(1, tpm // 2000)
+            if args.extraction_workers > safe_workers:
+                print(
+                    f"Clamping --extraction-workers {args.extraction_workers} -> {safe_workers} "
+                    f"(based on {tpm} tokens/min)"
+                )
+                args.extraction_workers = safe_workers
 
         orchestrator, retrieval_engine, active_extractor = create_pipeline(
             pg_connection=pg_conn,
@@ -430,7 +472,6 @@ def main() -> int:
         )
         if args.extraction_workers > 0:
             print(f"Extraction prefetch enabled: {args.extraction_workers} concurrent calls per instance")
-        _report_rate_limits(llm_client)
 
         evaluate_dataset(
             instances=payload,

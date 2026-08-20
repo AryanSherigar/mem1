@@ -85,6 +85,31 @@ class FakeHydra:
             return [{"path": [{"logical_key": "entity-1"}, {}, {"logical_key": "entity-2"}]}]
         return []
 
+class FakeHydraWithEntities:
+    """Like FakeHydra but resolves OPTIONAL MATCH's entity_key per-$fid, so a
+    test can control which facts share an entity vs which don't -- needed to
+    exercise entity_fact_count actually varying (it used to be hardcoded to 1
+    for every fact, so entity_boost was a constant regardless of fixture)."""
+
+    def __init__(self, entity_key_by_fid):
+        self.entity_key_by_fid = entity_key_by_fid
+
+    def read(self, cypher, params, bookmark):
+        if "SUPERSEDES" in cypher:
+            return []
+        if "OPTIONAL MATCH" in cypher:
+            fid = params.get("fid")
+            return [{
+                "text": None, "speaker": None,
+                "valid_from": 0, "valid_to": 9999999999,
+                "observed_at": 1000, "superseded_at": 9999999999,
+                "memory_scope": None, "entity_key": self.entity_key_by_fid.get(fid),
+            }]
+        if "algo.MSpaths" in cypher:
+            return []
+        return []
+
+
 class TestRetrievalEngine(unittest.TestCase):
     def test_temporal_resolver_adds_buffer(self):
         base_time = datetime(2026, 8, 19, tzinfo=timezone.utc)
@@ -144,6 +169,78 @@ class TestRetrievalEngine(unittest.TestCase):
         
         ans = engine.retrieve_and_answer("ctx-1", "where is dog?", datetime.now(timezone.utc))
         self.assertEqual(ans, "The dog is in the park")
+
+    def test_entity_boost_reflects_real_inverse_frequency(self):
+        """entity_fact_count used to be hardcoded to 1 for every fact, so
+        entity_boost (retrieval_entity_boost_cap / entity_fact_count) was the
+        same constant (the cap) for every fact regardless of the graph --
+        one of composite scoring's four signals contributed nothing to
+        ranking. Two facts sharing an entity should now get a smaller boost
+        than a fact whose entity is unique to it."""
+        llm = FakeLLMClient([])
+        conn = FakeConnection(registry_rows=[("fact:fact-1", 1), ("fact:fact-2", 2), ("fact:fact-3", 3)])
+        hydra = FakeHydraWithEntities({1: "entity-common", 2: "entity-common", 3: "entity-rare"})
+        engine = HybridRetrievalEngine(llm, FakeEmbedder(), conn, hydra)
+
+        seed_facts = {
+            "fact-1": ScoredFact("fact-1", "shared A"),
+            "fact-2": ScoredFact("fact-2", "shared B"),
+            "fact-3": ScoredFact("fact-3", "unique"),
+        }
+        graph_data = engine._hydradb_graph_expansion("ctx-1", seed_facts, DateRange(), datetime.now(timezone.utc))
+
+        self.assertEqual(graph_data["fact-1"]["entity_fact_count"], 2)
+        self.assertEqual(graph_data["fact-2"]["entity_fact_count"], 2)
+        self.assertEqual(graph_data["fact-3"]["entity_fact_count"], 1)
+
+        cap = engine._config.retrieval_entity_boost_cap
+        shared_boost = min(cap / 2, cap)
+        unique_boost = min(cap / 1, cap)
+        self.assertLess(shared_boost, unique_boost)
+
+    def test_abstention_no_longer_ignores_strong_keyword_match(self):
+        """A fact found purely by keyword match (weak/no embedding similarity,
+        strong BM25 rank, no graph structure) used to trigger false abstention
+        because the check only ever looked at semantic_score. A real exact-term
+        hit -- the case BM25 exists for -- should not be discarded."""
+        llm = FakeLLMClient([
+            DateRange(valid_from=None, valid_to=None),
+            QueryRewriterOutput(decomposed_queries=["exact term"], synonyms=[]),
+        ], text_response="Found via keyword match")
+
+        # No semantic hit at all; BM25 rank=1.0 -> keyword_score = 1/(1+1) = 0.5,
+        # comfortably above the 0.3 default threshold. return_paths=False keeps
+        # structural_score at 0, so this exercises the keyword branch alone.
+        conn = FakeConnection(
+            bm25_rows=[("fact-1", "exact term match", 1.0)],
+            registry_rows=[("fact:fact-1", 1)],
+            missing_text_rows=[("fact-1", "exact term match")],
+        )
+        engine = HybridRetrievalEngine(llm, FakeEmbedder(), conn, FakeHydra(return_paths=False))
+
+        ans = engine.retrieve_and_answer("ctx-1", "exact term", datetime.now(timezone.utc))
+        self.assertEqual(ans, "Found via keyword match")
+
+    def test_keyword_search_falls_back_to_raw_question_when_rewriter_empty(self):
+        """An empty rewriter result (a real failure mode: it's on the same LLM
+        call path that's failed live this session on credentials/timeouts)
+        used to skip BM25 for the whole request. It should degrade to the raw
+        question instead of going silent."""
+        llm = FakeLLMClient([
+            DateRange(valid_from=None, valid_to=None),
+            QueryRewriterOutput(decomposed_queries=[], synonyms=[]),  # rewriter produced nothing
+        ], text_response="Found via raw-question fallback")
+
+        conn = FakeConnection(
+            bm25_rows=[("fact-1", "matches raw question", 1.0)],
+            registry_rows=[("fact:fact-1", 1)],
+            missing_text_rows=[("fact-1", "matches raw question")],
+        )
+        engine = HybridRetrievalEngine(llm, FakeEmbedder(), conn, FakeHydra(return_paths=False))
+
+        ans = engine.retrieve_and_answer("ctx-1", "raw question text", datetime.now(timezone.utc))
+        self.assertEqual(ans, "Found via raw-question fallback")
+
 
 if __name__ == "__main__":
     unittest.main()

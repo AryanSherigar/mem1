@@ -93,22 +93,24 @@ TEMPORAL_UPDATE_SYSTEM_PROMPT = (
     "to it just because the distinction is subtle."
 )
 
+# Deliberately terse. This is sent on EVERY extraction call, and measured on a
+# real LongMemEval instance the fixed overhead (this prompt + the JSON schema)
+# was 2237 chars against a mean turn content of only 882 — 72% of each request
+# was boilerplate, which at a tokens-per-minute rate limit directly caps
+# throughput. Field-by-field descriptions were removed because the JSON schema
+# already declares every field, its type, and its enum values; only guidance
+# the schema *cannot* express is kept here.
 FACT_EXTRACTION_SYSTEM_PROMPT = (
-    "You are a long-term memory extraction assistant. Extract atomic, enduring facts about the user "
-    "or assistant from the dialogue turn. Ignore trivial chitchat, transient pleasantries, greetings, "
-    "and anything true only for the duration of this conversation. Each fact must stand alone without "
-    "needing the rest of the dialogue to be understood — resolve pronouns to the entity they refer to. "
-    "Split compound statements into separate atomic facts rather than one merged sentence. "
-    "For each extracted fact, provide:\n"
-    "- text: The concise, self-contained atomic factual assertion.\n"
-    "- action: 'ADD' for new facts, 'UPDATE' if updating an existing attribute, 'DELETE' if invalidating a past fact.\n"
-    "- predicate_key: A clean snake_case predicate category (e.g. 'pet_name', 'favorite_food', 'location', 'hobby').\n"
-    "- entities: List of specific named entities mentioned in the fact (e.g. ['Max', 'Seattle']).\n"
-    "- confidence: Confidence score between 0.0 and 1.0 — reserve above 0.9 for facts stated as plain "
-    "assertions, and below 0.6 for hedged, sarcastic, or implied statements.\n"
-    "- exact_quote: The exact substring in the input text that provides direct evidence for this fact.\n"
-    "If the turn contains no durable facts, return an empty facts list rather than forcing one. "
-    "Respond with the JSON object only — no reasoning, preamble, or commentary before it."
+    "Extract atomic, enduring facts about the user or assistant from the dialogue turn. "
+    "Skip chitchat, pleasantries, and anything true only within this conversation. "
+    "Each fact must stand alone: resolve pronouns, and split compound statements into separate facts. "
+    "predicate_key is a snake_case category (e.g. pet_name, location, hobby). "
+    "entities lists named entities in the fact. "
+    "exact_quote is the verbatim substring evidencing the fact. "
+    "confidence: >0.9 plain assertions, <0.6 hedged or implied. "
+    "action: ADD, or UPDATE/DELETE if it changes or invalidates an earlier fact. "
+    "No durable facts means an empty facts list — do not invent one. "
+    "Return only the JSON object."
 )
 
 # {question_date} is substituted at call time (current reference time for the question).
@@ -205,6 +207,22 @@ class Config:
     # (45s cap became 135s of real wall clock — measured). Kept at 1 rather than 0
     # because Groq rate-limits on tokens-per-minute and a 429 deserves one retry.
     llm_sdk_max_retries: int = field(default_factory=lambda: int(os.getenv("LLM_SDK_MAX_RETRIES", "1")))
+    # Separate from both retry counts above: a 429 raises out of `.create()`
+    # rather than returning unparseable content, so neither of them ever saw it
+    # and rate-limited calls failed outright, silently dropping a turn's facts
+    # (confirmed live against Groq's 8k TPM free tier). Higher than the others
+    # because a tokens-per-minute limiter legitimately needs several waits in a
+    # row under concurrent prefetch; each wait honors the provider's own stated
+    # retry-after, so this is mostly-idle time, not repeated load.
+    llm_rate_limit_max_retries: int = field(default_factory=lambda: int(os.getenv("LLM_RATE_LIMIT_MAX_RETRIES", "5")))
+    # How the response shape is described to the model: "typedef" (compact
+    # TS/BAML-style class declaration) or "json_schema" (pydantic's own output).
+    # Measured on the extraction schema: 839 chars as raw JSON Schema, 479 with
+    # noise keys stripped, 225 as a typedef. That blob rides on every single
+    # call, so under a tokens-per-minute limit it is throughput, not cosmetics.
+    # Groq reports no prompt caching (verified: identical prompts billed at full
+    # price twice, no `cached_tokens` field), so nothing amortizes this for us.
+    llm_schema_format: str = field(default_factory=lambda: os.getenv("LLM_SCHEMA_FORMAT", "typedef"))
     # Sent only when non-empty, because valid values are model-specific
     # (qwen3.6: none|default — gpt-oss: low|medium|high) and an unsupported
     # value is a hard 400. Empty string omits the parameter entirely, which is
@@ -316,6 +334,8 @@ class Config:
             base_url=base_url, api_key=api_key, model_name=model,
             sdk_max_retries=self.llm_sdk_max_retries,
             reasoning_effort=self.llm_reasoning_effort,
+            rate_limit_max_retries=self.llm_rate_limit_max_retries,
+            schema_format=self.llm_schema_format,
         )
 
     def get_entity_resolution_client(self) -> LLMClient:

@@ -203,7 +203,24 @@ class PostgresExtractionStore:
 
 
 class PostgresGraphManifestStore:
-    """Reject changed payload before a non-atomic local HydraDB write begins."""
+    """Reject changed payload before a non-atomic local HydraDB write begins.
+
+    One narrow, deliberate exception: `NODE_MUTABLE_PROPERTIES`. Bitemporal
+    supersession (ADR-030) needs to flip `is_current`/`superseded_at`/`valid_to`
+    on a Fact node that was already fully written in an earlier turn's plan —
+    `graph_plan_builder.py` only has the prior fact's `FactState` (not its full
+    original property set) at that point, so it can only ever build a partial
+    node for the update. Under strict whole-payload immutability that partial
+    node's hash would always differ from the original, so every supersession
+    would hit the exact same `GraphPayloadConflictError` the Session-node bug
+    did (see `graph_plan_builder.py`'s `_session_node` docstring) — this is that
+    same class of bug, caught before it could fire, not a hypothetical. Any
+    field outside that fixed allow-list still triggers a hard conflict, which
+    preserves the original guarantee: only a real logical_key collision can
+    reach it now.
+    """
+
+    NODE_MUTABLE_PROPERTIES = frozenset({"is_current", "superseded_at", "valid_to"})
 
     def __init__(self, connection: object) -> None:
         self._connection = connection
@@ -215,18 +232,50 @@ class PostgresGraphManifestStore:
                     kind = "node" if isinstance(record, GraphNode) else "relationship"
                     payload_hash = plan.payload_hash(record)
                     cursor.execute(
-                        "SELECT graph_id, payload_hash FROM graph_write_manifests WHERE record_kind = %s AND context_id = %s AND logical_key = %s FOR UPDATE",
+                        "SELECT graph_id, payload_hash, payload FROM graph_write_manifests WHERE record_kind = %s AND context_id = %s AND logical_key = %s FOR UPDATE",
                         (kind, plan.context_id, record.logical_key),
                     )
                     existing = cursor.fetchone()
                     if existing is not None:
-                        if existing != (record.graph_id, payload_hash):
+                        existing_graph_id, existing_hash, existing_payload = existing
+                        if (existing_graph_id, existing_hash) == (record.graph_id, payload_hash):
+                            continue
+                        merged_payload = None
+                        if kind == "node" and existing_graph_id == record.graph_id:
+                            merged_payload = self._merge_mutable_only(existing_payload, self._payload(record))
+                        if merged_payload is None:
                             raise GraphPayloadConflictError(f"{kind} {record.logical_key} has a different immutable graph payload")
+                        merged_hash = self._hash(merged_payload)
+                        cursor.execute(
+                            "UPDATE graph_write_manifests SET payload_hash = %s, payload = %s::jsonb "
+                            "WHERE record_kind = %s AND context_id = %s AND logical_key = %s",
+                            (merged_hash, json.dumps(merged_payload, sort_keys=True), kind, plan.context_id, record.logical_key),
+                        )
                         continue
                     cursor.execute(
                         "INSERT INTO graph_write_manifests (record_kind, context_id, logical_key, graph_id, payload_hash, payload) VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
                         (kind, plan.context_id, record.logical_key, record.graph_id, payload_hash, json.dumps(self._payload(record), sort_keys=True)),
                     )
+
+    @classmethod
+    def _merge_mutable_only(cls, existing_payload: dict[str, object], new_payload: dict[str, object]) -> dict[str, object] | None:
+        """Returns a merged payload if `new_payload` only touches properties in
+        `NODE_MUTABLE_PROPERTIES` relative to `existing_payload`, else None (a
+        real conflict). The merge is additive over the *existing* full property
+        set — it never drops a property the new (partial) payload omits."""
+        if existing_payload.get("label") != new_payload.get("label"):
+            return None
+        merged_properties = dict(existing_payload.get("properties", {}))
+        for key, value in new_payload.get("properties", {}).items():
+            if key in merged_properties and merged_properties[key] != value and key not in cls.NODE_MUTABLE_PROPERTIES:
+                return None
+            merged_properties[key] = value
+        return {"label": existing_payload["label"], "id": existing_payload["id"], "properties": merged_properties}
+
+    @staticmethod
+    def _hash(payload: dict[str, object]) -> str:
+        import hashlib
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     @staticmethod
     def _payload(record: GraphNode | GraphRelationship) -> dict[str, object]:

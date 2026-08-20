@@ -238,3 +238,55 @@ class PostgresPersistenceTests(unittest.TestCase):
         changed = GraphWritePlan(context_id, "plan:001", (GraphNode(graph_id, "Session", "session:001", {"context_id": context_id, "session_id": "changed"}),), ())
         with self.assertRaises(GraphPayloadConflictError):
             manifest.register(changed)
+
+    def test_graph_manifest_allows_supersession_mutable_fields_only(self) -> None:
+        """SUPERSEDES (ADR-030) needs to flip is_current/superseded_at/valid_to on
+        a Fact node that was already fully registered in an earlier turn's plan.
+        Without this allowance, the second write below would hit the exact same
+        GraphPayloadConflictError the Session-node bug did (different partial
+        payload, same logical_key) -- the bug this test guards against was never
+        hypothetical, it's the same shape, just for a different node kind."""
+        store = PostgresChunkStore(self.connection)
+        context_id = f"context:{uuid4().hex}"
+        graph_id = store.allocate_graph_id("fact", context_id, "fact:cand-001")
+        manifest = PostgresGraphManifestStore(self.connection)
+
+        full_properties = {
+            "context_id": context_id, "logical_key": "fact:cand-001", "text": "Max lives in Boston",
+            "speaker": "user", "predicate_key": "lives_in", "is_current": True,
+            "superseded_at": 9999999999, "valid_to": 9999999999,
+        }
+        original = GraphWritePlan(context_id, "plan:001", (GraphNode(graph_id, "Fact", "fact:cand-001", full_properties),), ())
+        manifest.register(original)
+
+        # A later turn's SUPERSEDES handling only has these 3 fields to send --
+        # not the fact's full original property set (graph_plan_builder.py only
+        # has a FactState, not the original GraphNode, at that point).
+        partial_update = {
+            "context_id": context_id, "logical_key": "fact:cand-001",
+            "is_current": False, "superseded_at": 1750000000, "valid_to": 1750000000,
+        }
+        superseded = GraphWritePlan(context_id, "plan:002", (GraphNode(graph_id, "Fact", "fact:cand-001", partial_update),), ())
+        manifest.register(superseded)  # must NOT raise
+
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT payload FROM graph_write_manifests WHERE record_kind = 'node' AND context_id = %s AND logical_key = %s",
+                (context_id, "fact:cand-001"),
+            )
+            stored = cursor.fetchone()[0]
+
+        # The merge must be additive: text/speaker/predicate_key (never resent)
+        # survive, while the 3 mutable fields reflect the update.
+        self.assertEqual(stored["properties"]["text"], "Max lives in Boston")
+        self.assertEqual(stored["properties"]["speaker"], "user")
+        self.assertEqual(stored["properties"]["predicate_key"], "lives_in")
+        self.assertEqual(stored["properties"]["is_current"], False)
+        self.assertEqual(stored["properties"]["superseded_at"], 1750000000)
+
+        # A genuine conflict (a non-mutable field actually changing) must still
+        # raise -- this allowance must not become a general escape hatch.
+        real_conflict = {**partial_update, "text": "Max lives in Seattle"}
+        conflicting = GraphWritePlan(context_id, "plan:003", (GraphNode(graph_id, "Fact", "fact:cand-001", real_conflict),), ())
+        with self.assertRaises(GraphPayloadConflictError):
+            manifest.register(conflicting)

@@ -13,6 +13,7 @@ from context_memory.ingestion.embedding import SentenceTransformerEmbedder
 from context_memory.ingestion.extraction import ExtractionService
 from context_memory.ingestion.graph_plan_builder import GraphPlanBuilder
 from context_memory.ingestion.graph_writer import GraphWriter
+from context_memory.ingestion.fact_lookup import HydraFactLookup
 from context_memory.ingestion.model_adapters import LLMEntityResolutionModel, LLMExtractor, LLMTemporalUpdateModel
 from context_memory.ingestion.orchestrator import IngestionOrchestrator
 from context_memory.ingestion.resolution import EntityRegistry, TemporalUpdateClassifier
@@ -77,6 +78,7 @@ def get_engine() -> MemoryEngine:
 
     temporal_model = LLMTemporalUpdateModel(config.get_temporal_update_client(), config)
     update_classifier = TemporalUpdateClassifier(temporal_model)
+    fact_lookup = HydraFactLookup(hydra_transport)
 
     orchestrator = IngestionOrchestrator(
         chunk_store=chunk_store,
@@ -89,6 +91,7 @@ def get_engine() -> MemoryEngine:
         embedding_store=embedding_store,
         search_index_store=search_index_store,
         update_classifier=update_classifier,
+        find_existing_facts=fact_lookup.find_existing,
     )
 
     retrieval_engine = HybridRetrievalEngine(

@@ -7,13 +7,163 @@ Never called from core; never called directly from CI (see fakes.py).
 from __future__ import annotations
 
 import json
-from typing import Any
+import random
+import re
+import time
+import types
+from collections.abc import Sequence
+from typing import Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel
 
 from context_memory.core.logging import get_logger, timed_operation
 
 logger = get_logger(__name__)
+
+# Groq's 429 body states exactly how long to wait ("Please try again in 4.995s").
+# Honoring it beats a blind exponential backoff: too short re-triggers the limit,
+# too long wastes budget the limiter has already released.
+_RETRY_AFTER_PATTERN = re.compile(r"try again in ([0-9.]+)s")
+
+
+def _rate_limit_delay(error: Exception, attempt: int) -> float:
+    """Seconds to wait before retrying a rate-limited call.
+
+    Prefers the provider's own stated delay; falls back to capped exponential
+    backoff with jitter. Jitter matters here specifically because extraction
+    prefetch runs several workers concurrently — without it, every worker that
+    hit the same limit wakes at the same instant and immediately re-trips it.
+    """
+    match = _RETRY_AFTER_PATTERN.search(str(error))
+    if match:
+        try:
+            return min(float(match.group(1)) + random.uniform(0.1, 0.5), 60.0)
+        except ValueError:
+            pass
+    return min(2.0 ** attempt + random.uniform(0.1, 0.5), 60.0)
+
+
+# Keys pydantic emits that constrain nothing the model needs: "title" is just a
+# prettified field name it already has, and "default" describes what the caller
+# does with an omitted field, not what the model may return. Stripping both, plus
+# whitespace-free separators, cut the extraction schema 839 -> 479 chars (43%).
+# That blob is sent on every single call, so at a tokens-per-minute rate limit it
+# is a direct throughput cost, not a cosmetic one.
+_SCHEMA_NOISE_KEYS = frozenset({"title", "default"})
+
+_schema_cache: dict[type[BaseModel], str] = {}
+
+
+def _strip_schema_noise(node: Any) -> Any:
+    if isinstance(node, dict):
+        return {k: _strip_schema_noise(v) for k, v in node.items() if k not in _SCHEMA_NOISE_KEYS}
+    if isinstance(node, list):
+        return [_strip_schema_noise(v) for v in node]
+    return node
+
+
+def _compact_schema_json(response_schema: type[BaseModel]) -> str:
+    """Serialized once per schema class, then cached — the result is identical
+    for every call with the same schema, and this runs on a per-turn hot path."""
+    cached = _schema_cache.get(response_schema)
+    if cached is None:
+        cached = json.dumps(
+            _strip_schema_noise(response_schema.model_json_schema()), separators=(",", ":")
+        )
+        _schema_cache[response_schema] = cached
+    return cached
+
+
+_PRIMITIVE_TYPE_NAMES = {str: "string", int: "int", float: "float", bool: "bool"}
+
+_typedef_cache: dict[type[BaseModel], str] = {}
+
+
+def _model_name(model: type[BaseModel]) -> str:
+    # Internal response models are underscore-prefixed by convention
+    # (`_FactExtractionResponse`); that prefix is a Python visibility hint and
+    # means nothing to the model, so it is not spent as prompt tokens.
+    return model.__name__.lstrip("_")
+
+
+def _render_type(annotation: Any) -> str:
+    origin = get_origin(annotation)
+
+    if origin is Literal:
+        return " | ".join(json.dumps(value) for value in get_args(annotation))
+
+    if origin is Union or origin is types.UnionType:
+        args = get_args(annotation)
+        non_none = [a for a in args if a is not type(None)]
+        suffix = "?" if type(None) in args else ""
+        if not non_none:
+            return "null"
+        return _render_type(non_none[0]) + suffix
+
+    if origin in (list, tuple, set, frozenset, Sequence):
+        args = get_args(annotation)
+        return (_render_type(args[0]) if args else "any") + "[]"
+
+    if origin is dict:
+        return "map"
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return _model_name(annotation)
+
+    return _PRIMITIVE_TYPE_NAMES.get(annotation, getattr(annotation, "__name__", "any"))
+
+
+def _render_typedef(model: type[BaseModel], emitted: list[type[BaseModel]] | None = None) -> str:
+    """Renders a pydantic model as a compact TypeScript/BAML-style type
+    declaration instead of JSON Schema.
+
+    Measured on the extraction schema: 839 chars as pydantic JSON Schema, 479
+    with the noise keys stripped, 225 as a typedef — 73% off the original, on a
+    blob sent with every single call. JSON Schema spends most of its length on
+    structural scaffolding (`"properties"`, `"type":"string"`, `"$defs"`,
+    `"$ref"`) that a typedef expresses positionally. `response_format` is still
+    set to `json_object`, so JSON output remains enforced by the provider; this
+    only changes how the *shape* is described.
+    """
+    emitted = [] if emitted is None else emitted
+    if model in emitted:
+        return ""
+    emitted.append(model)
+
+    nested_blocks: list[str] = []
+    lines: list[str] = []
+    for field_name, field in model.model_fields.items():
+        annotation = field.annotation
+        inner = annotation
+        origin = get_origin(annotation)
+        if origin in (list, tuple, set, frozenset, Sequence):
+            args = get_args(annotation)
+            inner = args[0] if args else None
+        elif origin is Union or origin is types.UnionType:
+            non_none = [a for a in get_args(annotation) if a is not type(None)]
+            inner = non_none[0] if non_none else None
+        if isinstance(inner, type) and issubclass(inner, BaseModel):
+            block = _render_typedef(inner, emitted)
+            if block:
+                nested_blocks.append(block)
+        lines.append(f"  {field_name} {_render_type(annotation)}")
+
+    block = "\n".join([f"class {_model_name(model)} {{", *lines, "}"])
+    return "\n".join([*nested_blocks, block])
+
+
+def _compact_schema_typedef(response_schema: type[BaseModel]) -> str:
+    cached = _typedef_cache.get(response_schema)
+    if cached is None:
+        cached = _render_typedef(response_schema)
+        _typedef_cache[response_schema] = cached
+    return cached
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    if type(error).__name__ == "RateLimitError":
+        return True
+    return getattr(error, "status_code", None) == 429
 
 
 class LLMClientError(RuntimeError):
@@ -32,6 +182,8 @@ class LLMClient:
         client: Any | None = None,
         sdk_max_retries: int = 1,
         reasoning_effort: str = "",
+        rate_limit_max_retries: int = 5,
+        schema_format: str = "typedef",
     ) -> None:
         if not base_url or not model_name:
             raise ValueError("base_url and model_name must be non-empty")
@@ -39,6 +191,12 @@ class LLMClient:
         self.api_key = api_key
         self.model = model_name
         self.sdk_max_retries = sdk_max_retries
+        self.rate_limit_max_retries = rate_limit_max_retries
+        # "typedef" (compact TS/BAML-style) or "json_schema" (pydantic's own).
+        # Provider-side JSON enforcement comes from `response_format`, not from
+        # this — it only describes the shape, so switching formats cannot make
+        # output non-JSON, only differently guided.
+        self.schema_format = schema_format
         # Only forwarded when truthy — valid values differ per model family and
         # an unsupported one is a hard 400, so "" must mean "omit entirely".
         self.reasoning_effort = reasoning_effort
@@ -47,6 +205,35 @@ class LLMClient:
     def _apply_reasoning_effort(self, create_kwargs: dict[str, Any]) -> None:
         if self.reasoning_effort:
             create_kwargs["reasoning_effort"] = self.reasoning_effort
+
+    def _create_with_rate_limit_retry(self, create_kwargs: dict[str, Any]) -> Any:
+        """Issues the API call, retrying only on rate limiting.
+
+        Distinct from `structured_completion`'s own retry loop, which handles a
+        different failure: a 200 response whose *content* is empty/unparseable.
+        A 429 never reaches that loop — it raises out of `.create()` — so it was
+        previously not retried at all here, and the SDK's own retry budget
+        (`sdk_max_retries`, deliberately lowered to 1 because it silently
+        multiplies timeouts) is far too small for a token-per-minute limiter
+        that can need multiple waits in a row. Confirmed live, not theoretical:
+        extraction prefetch against Groq's 8k TPM free tier failed outright with
+        `RateLimitError` and silently dropped those turns' facts.
+        """
+        last_error: Exception | None = None
+        for attempt in range(self.rate_limit_max_retries + 1):
+            try:
+                return self.client.chat.completions.create(**create_kwargs)
+            except Exception as error:
+                if not _is_rate_limit_error(error) or attempt == self.rate_limit_max_retries:
+                    raise
+                last_error = error
+                delay = _rate_limit_delay(error, attempt)
+                logger.warning(
+                    "Rate limited (attempt %d/%d); waiting %.1fs before retry",
+                    attempt + 1, self.rate_limit_max_retries + 1, delay,
+                )
+                time.sleep(delay)
+        raise last_error if last_error else RuntimeError("unreachable")
 
     @property
     def client(self) -> Any:
@@ -102,10 +289,14 @@ class LLMClient:
         """
         schema_name = response_schema.__name__
         with timed_operation(logger, f"llm.structured_completion[{schema_name}]", {"model": self.model, "prompt_chars": len(user_prompt)}) as ctx:
-            schema_json = json.dumps(response_schema.model_json_schema())
-            augmented_system = (
-                f"{system_prompt}\n\nYou MUST return a valid JSON object strictly matching this schema:\n{schema_json}"
-            )
+            if self.schema_format == "typedef":
+                augmented_system = (
+                    f"{system_prompt}\n\nReturn JSON matching:\n{_compact_schema_typedef(response_schema)}"
+                )
+            else:
+                augmented_system = (
+                    f"{system_prompt}\n\nReturn JSON matching this schema:\n{_compact_schema_json(response_schema)}"
+                )
             current_user_prompt = user_prompt
             current_max_tokens = max_tokens
             last_error: Exception | None = None
@@ -125,7 +316,7 @@ class LLMClient:
                 if timeout is not None:
                     create_kwargs["timeout"] = timeout
                 self._apply_reasoning_effort(create_kwargs)
-                response = self.client.chat.completions.create(**create_kwargs)
+                response = self._create_with_rate_limit_retry(create_kwargs)
                 if hasattr(response, "usage") and response.usage:
                     ctx["prompt_tokens"] = response.usage.prompt_tokens
                     ctx["completion_tokens"] = response.usage.completion_tokens
@@ -184,7 +375,7 @@ class LLMClient:
             if timeout is not None:
                 create_kwargs["timeout"] = timeout
             self._apply_reasoning_effort(create_kwargs)
-            response = self.client.chat.completions.create(**create_kwargs)
+            response = self._create_with_rate_limit_retry(create_kwargs)
             if hasattr(response, "usage") and response.usage:
                 ctx["prompt_tokens"] = response.usage.prompt_tokens
                 ctx["completion_tokens"] = response.usage.completion_tokens

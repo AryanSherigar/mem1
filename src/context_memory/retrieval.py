@@ -190,8 +190,13 @@ class HybridRetrievalEngine:
                     else:
                         facts[fact_id].semantic_score = max(facts[fact_id].semantic_score, semantic_score)
 
-            # 2. Keyword Search (BM25)
-            keywords = " | ".join(expanded_query.synonyms + expanded_query.decomposed_queries)
+            # 2. Keyword Search (BM25). Falls back to the raw question when the
+            # rewriter produced nothing -- previously an empty rewriter result
+            # (a real, observed failure mode: the rewriter is on the same LLM
+            # call path that's failed live this session on credentials and
+            # timeouts) skipped BM25 entirely for the whole request, silently
+            # losing exact-term recall rather than degrading to it.
+            keywords = " | ".join(expanded_query.synonyms + expanded_query.decomposed_queries) or question
             if keywords:
                 with self._pg.cursor() as cursor:
                     cursor.execute(
@@ -405,10 +410,23 @@ class HybridRetrievalEngine:
 
             for f_id in seed_facts.keys():
                 fact_key = f"fact:{f_id}"
+                # Inverse-frequency signal: `entity_to_facts` (built above, per
+                # this query's seed set) maps an entity to every seed fact that
+                # mentions it. A fact whose entity is shared by many other seed
+                # facts is less distinctive *for this query* than one whose
+                # entity appears nowhere else, so it should get less of a boost
+                # -- entity_boost's own formula (retrieval_entity_boost_cap /
+                # entity_fact_count) already implements the falloff correctly;
+                # it just never received a real count before (was hardcoded 1,
+                # making every fact's boost identically the cap). No facts
+                # linked to an entity default to 1 (no penalty, no bonus),
+                # matching prior behavior for that case.
+                entity_key = entity_key_by_fact.get(fact_key)
+                entity_fact_count = len(entity_to_facts.get(entity_key, ())) if entity_key else 1
                 graph_data[f_id] = {
                     "hop_count": hop_count_by_fact.get(fact_key, 1),
                     "path_count": path_count_by_fact.get(fact_key, 0),
-                    "entity_fact_count": 1  # baseline; real inverse-frequency weighting not yet wired, see AGENTS/decisions
+                    "entity_fact_count": entity_fact_count,
                 }
 
             return graph_data
@@ -435,11 +453,27 @@ class HybridRetrievalEngine:
             # Sort facts
             ranked = sorted(facts.values(), key=lambda f: f.composite_score, reverse=True)
 
-            # Abstention check
+            # Abstention check. Was semantic-only: a fact found purely by BM25
+            # keyword match (e.g. an exact name/term the embedding missed) with
+            # zero structural support could trigger abstention even with a
+            # strong keyword_score, because that score was never looked at.
+            # Confirmed reachable: the query rewriter is on the same LLM call
+            # path that's failed live in this session (credentials, timeouts),
+            # and its failure zeroes every keyword_score for the whole request
+            # (see _semantic_and_keyword_seeding) -- but that's a rewriter
+            # failure feeding in a real zero, not this check's own bug; abstain
+            # only when semantic, keyword, AND structural are all weak.
             threshold = self._config.retrieval_abstention_semantic_threshold
-            if not ranked or (ranked[0].semantic_score < threshold and ranked[0].structural_score == 0):
+            if not ranked or (
+                ranked[0].semantic_score < threshold
+                and ranked[0].keyword_score < threshold
+                and ranked[0].structural_score == 0
+            ):
                 ctx["abstention_triggered"] = True
-                logger.info("Retrieval: Abstention triggered (max semantic score < %s and zero structural score)", threshold)
+                logger.info(
+                    "Retrieval: Abstention triggered (semantic/keyword scores below %s, zero structural score)",
+                    threshold,
+                )
                 return self._config.retrieval_abstention_message
 
             top_facts = ranked[:top_k]
