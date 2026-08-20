@@ -25,6 +25,7 @@ src/context_memory/core/validation.py
 src/context_memory/ingestion/__init__.py
 src/context_memory/ingestion/embedding.py
 src/context_memory/ingestion/extraction.py
+src/context_memory/ingestion/fact_lookup.py
 src/context_memory/ingestion/fakes.py
 src/context_memory/ingestion/graph_plan_builder.py
 src/context_memory/ingestion/graph_writer.py
@@ -68,6 +69,7 @@ src/tests/test_hydradb_http.py
 src/tests/test_hydradb_live.py
 src/tests/test_ingestion_service.py
 src/tests/test_job_transitions.py
+src/tests/test_llm_client_rate_limit.py
 src/tests/test_logging.py
 src/tests/test_longmemeval_adapter.py
 src/tests/test_migrations.py

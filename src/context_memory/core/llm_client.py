@@ -327,7 +327,17 @@ class LLMClient:
                 try:
                     if not raw_text:
                         raise ValueError("empty completion content")
-                    return response_schema.model_validate_json(raw_text)
+                    cleaned_text = raw_text.strip()
+                    if cleaned_text.startswith("```"):
+                        lines = cleaned_text.splitlines()
+                        if lines[0].startswith("```"):
+                            lines = lines[1:]
+                        if lines and lines[-1].startswith("```"):
+                            lines = lines[:-1]
+                        cleaned_text = "\n".join(lines).strip()
+                    if cleaned_text.startswith("{\n{") or cleaned_text.startswith("{\r\n{") or cleaned_text.startswith("{{"):
+                        cleaned_text = cleaned_text[1:].strip()
+                    return response_schema.model_validate_json(cleaned_text)
                 except Exception as error:  # pydantic ValidationError, malformed JSON, or empty content
                     last_error = error
                     if attempt < max_retries:

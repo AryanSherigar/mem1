@@ -28,11 +28,13 @@ class GraphWriter:
             for relationship in plan.relationships:
                 relationships[(relationship.relationship_type, relationship.source_label, relationship.destination_label, tuple(sorted(relationship.properties)))].append(relationship)
             for (label, property_names), group in nodes.items():
-                bookmark = self._transport.write(self._node_query(label, property_names), self._node_rows(group), self._key(plan, f"node-{label}-{'-'.join(property_names)}"))
+                rows = self._node_rows(group)
+                bookmark = self._transport.write(self._node_query(label, property_names), rows, self._key(plan, f"node-{label}-{'-'.join(property_names)}", rows))
                 if bookmark:
                     bookmarks.append(bookmark)
             for (relationship_type, source_label, destination_label, property_names), group in relationships.items():
-                bookmark = self._transport.write(self._relationship_query(relationship_type, source_label, destination_label, property_names), self._relationship_rows(group), self._key(plan, f"relationship-{relationship_type}-{source_label}-{destination_label}-{'-'.join(property_names)}"))
+                rows = self._relationship_rows(group)
+                bookmark = self._transport.write(self._relationship_query(relationship_type, source_label, destination_label, property_names), rows, self._key(plan, f"relationship-{relationship_type}-{source_label}-{destination_label}-{'-'.join(property_names)}", rows))
                 if bookmark:
                     bookmarks.append(bookmark)
             ctx["bookmarks_received"] = len(bookmarks)
@@ -57,5 +59,7 @@ class GraphWriter:
         return [{"id": item.graph_id, "source_id": item.source_id, "destination_id": item.destination_id, **dict(item.properties)} for item in relationships]
 
     @staticmethod
-    def _key(plan: GraphWritePlan, phase: str) -> str:
-        return f"context-memory-{sha256(f'{plan.context_id}\x00{plan.plan_key}\x00{phase}'.encode()).hexdigest()}"
+    def _key(plan: GraphWritePlan, phase: str, rows: list[dict[str, object]] | None = None) -> str:
+        import json
+        payload_bytes = json.dumps(rows, sort_keys=True, default=str).encode() if rows is not None else b""
+        return f"context-memory-{sha256(f'{plan.context_id}\x00{plan.plan_key}\x00{phase}\x00'.encode() + payload_bytes).hexdigest()}"

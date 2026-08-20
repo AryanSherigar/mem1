@@ -190,29 +190,27 @@ class HybridRetrievalEngine:
                     else:
                         facts[fact_id].semantic_score = max(facts[fact_id].semantic_score, semantic_score)
 
-            # 2. Keyword Search (BM25). Falls back to the raw question when the
-            # rewriter produced nothing -- previously an empty rewriter result
-            # (a real, observed failure mode: the rewriter is on the same LLM
-            # call path that's failed live this session on credentials and
-            # timeouts) skipped BM25 entirely for the whole request, silently
-            # losing exact-term recall rather than degrading to it.
-            keywords = " | ".join(expanded_query.synonyms + expanded_query.decomposed_queries) or question
-            if keywords:
+            # 2. Keyword Search (BM25). Use websearch_to_tsquery with OR combination and @@ matching
+            terms = [t.strip() for t in (expanded_query.synonyms + expanded_query.decomposed_queries + [question]) if t.strip()]
+            search_query_str = " OR ".join(f'"{t}"' if " " in t else t for t in terms) if terms else question
+            if search_query_str:
                 with self._pg.cursor() as cursor:
                     cursor.execute(
                         """
-                        SELECT fact_id, raw_text, ts_rank_cd(text_tsvector, plainto_tsquery('english', %s)) AS rank
+                        SELECT fact_id, raw_text, ts_rank_cd(text_tsvector, websearch_to_tsquery('english', %s)) AS rank
                         FROM fact_search_index
-                        WHERE context_id = %s AND is_active = true
+                        WHERE context_id = %s AND is_active = true AND text_tsvector @@ websearch_to_tsquery('english', %s)
                         ORDER BY rank DESC
                         LIMIT %s
                         """,
-                        (keywords, context_id, limit)
+                        (search_query_str, context_id, search_query_str, limit)
                     )
                     for row in cursor.fetchall():
                         fact_id = str(row[0])
                         raw_text = str(row[1])
                         rank = float(row[2]) if row[2] is not None else 0.0
+                        if rank <= 0.0:
+                            continue
                         keyword_score = rank / (1.0 + rank)
                         if fact_id not in facts:
                             facts[fact_id] = ScoredFact(fact_id, raw_text, keyword_score=keyword_score)
@@ -281,6 +279,19 @@ class HybridRetrievalEngine:
             raw_nodes = []
             entity_key_by_fact: dict[str, str] = {}
             for fact_key, graph_id in graph_id_by_fact_key.items():
+                node_cypher = f"""
+                MATCH (f {{id: {int(graph_id)}}})
+                OPTIONAL MATCH (f)-[:ABOUT]->(e)
+                RETURN
+                    f.text AS text,
+                    f.speaker AS speaker,
+                    f.valid_from AS valid_from,
+                    f.valid_to AS valid_to,
+                    f.observed_at AS observed_at,
+                    f.superseded_at AS superseded_at,
+                    f.memory_scope AS memory_scope,
+                    e.logical_key AS entity_key
+                """
                 try:
                     rows = self._hydra.read(node_cypher, {"fid": graph_id}, None)
                 except Exception as e:
@@ -359,20 +370,19 @@ class HybridRetrievalEngine:
 
             # 2. Execute algo.MSpaths
             if entities:
-                path_cypher = """
-                CALL algo.MSpaths({
+                escaped_entities = ", ".join(f"'{e.replace("'", "''")}'" for e in entities)
+                path_cypher = f"""
+                CALL algo.MSpaths({{
                     sourceLabel: 'Entity',
                     sourceProperty: 'logical_key',
-                    sourceValues: $entities,
+                    sourceValues: [{escaped_entities}],
                     relTypes: ['ABOUT'],
-                    maxLen: $max_hops
-                }) YIELD path
+                    maxLen: {int(self._config.retrieval_graph_max_hops)}
+                }}) YIELD path
                 RETURN path
                 """
                 try:
-                    path_res = self._hydra.read(
-                        path_cypher, {"entities": list(entities), "max_hops": self._config.retrieval_graph_max_hops}, None
-                    )
+                    path_res = self._hydra.read(path_cypher, {}, None)
                     for row in path_res:
                         path = row.get("path", [])
                         if len(path) >= 3:
@@ -391,38 +401,10 @@ class HybridRetrievalEngine:
                 except Exception as e:
                     logger.debug("algo.MSpaths query skipped: %s", e)
 
-            # 3. Traverse SUPERSEDES. Per-fact, same reasoning as step 1 above.
-            # Note: its result isn't consumed by scoring yet (`sup_res` was
-            # already dead — computed, never read — before this fix; left as
-            # the same no-op pending real use rather than silently invented).
-            supersedes_cypher = """
-            MATCH (f {id: $fid})-[:SUPERSEDES*1..5]->(old)
-            RETURN count(old) AS superseded_count
-            """
-            for fact_key in valid_fact_keys:
-                graph_id = graph_id_by_fact_key.get(fact_key)
-                if graph_id is None:
-                    continue
-                try:
-                    self._hydra.read(supersedes_cypher, {"fid": graph_id}, None)
-                except Exception as e:
-                    logger.debug("SUPERSEDES query skipped for %s: %s", fact_key, e)
-
             for f_id in seed_facts.keys():
                 fact_key = f"fact:{f_id}"
-                # Inverse-frequency signal: `entity_to_facts` (built above, per
-                # this query's seed set) maps an entity to every seed fact that
-                # mentions it. A fact whose entity is shared by many other seed
-                # facts is less distinctive *for this query* than one whose
-                # entity appears nowhere else, so it should get less of a boost
-                # -- entity_boost's own formula (retrieval_entity_boost_cap /
-                # entity_fact_count) already implements the falloff correctly;
-                # it just never received a real count before (was hardcoded 1,
-                # making every fact's boost identically the cap). No facts
-                # linked to an entity default to 1 (no penalty, no bonus),
-                # matching prior behavior for that case.
                 entity_key = entity_key_by_fact.get(fact_key)
-                entity_fact_count = len(entity_to_facts.get(entity_key, ())) if entity_key else 1
+                entity_fact_count = len(entity_to_facts.get(entity_key, ())) if entity_key else 0
                 graph_data[f_id] = {
                     "hop_count": hop_count_by_fact.get(fact_key, 1),
                     "path_count": path_count_by_fact.get(fact_key, 0),
@@ -446,7 +428,7 @@ class HybridRetrievalEngine:
                 entity_fact_count = g.get("entity_fact_count", 0)
 
                 fact.structural_score = (1.0 / hop_count) * min(path_count, path_cap) / path_cap
-                fact.entity_boost = min(boost_cap / max(entity_fact_count, 1), boost_cap)
+                fact.entity_boost = boost_cap if entity_fact_count > 0 else 0.0
 
                 fact.composite_score = (fact.semantic_score + fact.keyword_score + fact.structural_score + fact.entity_boost) / divisor
 
