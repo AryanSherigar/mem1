@@ -105,7 +105,14 @@ FACT_EXTRACTION_SYSTEM_PROMPT = (
     "Skip chitchat, pleasantries, and anything true only within this conversation. "
     "Each fact must stand alone: resolve pronouns, and split compound statements into separate facts. "
     "predicate_key is a snake_case category (e.g. pet_name, location, hobby). "
-    "entities lists named entities in the fact. "
+    # "named entities" alone was read strictly as proper nouns, so any fact
+    # about a common-noun topic got an empty entity list -- 691 of 2685 facts
+    # (25.7%) on a real LongMemEval instance, including every "commute" fact
+    # for a question whose gold answer was about the user's commute. Entities
+    # are what graph expansion traverses and what the query-gated entity boost
+    # keys on, so an unlinked fact is invisible to both.
+    "entities lists the key subjects of the fact: named entities (people, places, "
+    "products) AND the salient topic nouns (e.g. commute, audiobooks, rent). "
     "exact_quote is the verbatim substring evidencing the fact. "
     "confidence: >0.9 plain assertions, <0.6 hedged or implied. "
     "action: ADD, or UPDATE/DELETE if it changes or invalidates an earlier fact. "

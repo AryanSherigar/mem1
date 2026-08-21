@@ -49,6 +49,59 @@ def _rate_limit_delay(error: Exception, attempt: int) -> float:
 # whitespace-free separators, cut the extraction schema 839 -> 479 chars (43%).
 # That blob is sent on every single call, so at a tokens-per-minute rate limit it
 # is a direct throughput cost, not a cosmetic one.
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _recover_json_object(raw_text: str) -> str:
+    """Returns the first parseable JSON object in `raw_text`.
+
+    Providers wrap or corrupt the JSON body in ways `response_format:
+    json_object` does not prevent. Observed live, deterministically (6/6 calls),
+    from Bedrock's `openai.gpt-oss-20b`: a spurious `{"` prefix, i.e.
+    `{"{"facts":[...]}` where `{"facts":[...]}` was meant. Markdown ``` fences
+    and leading prose are the other common shapes.
+
+    Scanning for the first balanced object handles all of them uniformly. The
+    prior approach special-cased literal prefixes (`{{`, `{\\n{`) and stripped a
+    single character, which by construction could not fix the `{"` case above --
+    two characters, and not a matched pattern. Enumerating malformations is a
+    losing game; finding the JSON is not.
+
+    Returns the input unchanged when nothing parses, so the caller's existing
+    error path still reports the real provider output.
+    """
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    try:
+        json.loads(text)
+        return text
+    except ValueError:
+        pass
+
+    # `raw_decode` stops at the end of the first valid value, so trailing junk
+    # is tolerated; scanning every '{' also skips any leading junk.
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _ = _JSON_DECODER.raw_decode(text, index)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            # Re-serialize rather than slicing the original: raw_decode returns
+            # the parsed value, and the source span may still contain the
+            # corruption we are recovering from.
+            return json.dumps(value)
+    return raw_text
+
+
 _SCHEMA_NOISE_KEYS = frozenset({"title", "default"})
 
 _schema_cache: dict[type[BaseModel], str] = {}
@@ -327,17 +380,7 @@ class LLMClient:
                 try:
                     if not raw_text:
                         raise ValueError("empty completion content")
-                    cleaned_text = raw_text.strip()
-                    if cleaned_text.startswith("```"):
-                        lines = cleaned_text.splitlines()
-                        if lines[0].startswith("```"):
-                            lines = lines[1:]
-                        if lines and lines[-1].startswith("```"):
-                            lines = lines[:-1]
-                        cleaned_text = "\n".join(lines).strip()
-                    if cleaned_text.startswith("{\n{") or cleaned_text.startswith("{\r\n{") or cleaned_text.startswith("{{"):
-                        cleaned_text = cleaned_text[1:].strip()
-                    return response_schema.model_validate_json(cleaned_text)
+                    return response_schema.model_validate_json(_recover_json_object(raw_text))
                 except Exception as error:  # pydantic ValidationError, malformed JSON, or empty content
                     last_error = error
                     if attempt < max_retries:

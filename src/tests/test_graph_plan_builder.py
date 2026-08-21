@@ -91,6 +91,31 @@ class GraphPlanBuilderTests(unittest.TestCase):
         self.assertEqual({n.graph_id for n in plan_a.nodes}, {n.graph_id for n in plan_b.nodes})
         self.assertEqual(plan_a.nodes, plan_b.nodes)
 
+    def test_speaker_node_does_not_collide_with_extracted_entity_of_same_name(self) -> None:
+        """The extractor genuinely emits "user"/"assistant" as entity surfaces.
+        When the speaker node also lived at `entity:{role}`, both resolved to the
+        same logical_key and the same allocated graph_id but carried different
+        entity_type values ("speaker" vs "other") -- a same-key/different-payload
+        pair that PostgresGraphManifestStore rejects by design. That aborted a
+        real LongMemEval run with GraphPayloadConflictError on
+        `node entity:assistant`."""
+        role = self.chunk.actor_role or "unknown"
+        profile = EntityProfile(
+            self.allocator.allocate_graph_id("entity", "context-001", f"entity:{role}"),
+            "context-001", role, "other",
+        )
+        candidate = _candidate(entities=(EntityCandidate(role, "other"),))
+        extraction = ExtractionResult("attempt-1", (candidate,), ())
+        plan = self.builder.build(self.chunk, extraction, resolve=lambda *a: profile)
+
+        by_key = {n.logical_key: n for n in plan.nodes}
+        self.assertIn(f"speaker:{role}", by_key)
+        self.assertIn(f"entity:{role}", by_key)
+        self.assertEqual(by_key[f"speaker:{role}"].properties["entity_type"], "speaker")
+        self.assertEqual(by_key[f"entity:{role}"].properties["entity_type"], "other")
+        # Distinct identities, so neither can overwrite the other's payload.
+        self.assertNotEqual(by_key[f"speaker:{role}"].graph_id, by_key[f"entity:{role}"].graph_id)
+
     def test_supersedes_edge_created(self) -> None:
         from context_memory.core.resolution import FactState, TemporalRelation, TemporalUpdateDecision
         

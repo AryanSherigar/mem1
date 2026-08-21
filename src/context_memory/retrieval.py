@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -155,7 +157,7 @@ class HybridRetrievalEngine:
                     logger.debug("PostgreSQL fallback fact_search_index query skipped: %s", e)
 
             # Phase 3: 4-Factor Composite Scoring & Synthesis
-            answer = self._composite_scoring_and_synthesis(question, seed_facts, graph_data, top_k)
+            answer = self._composite_scoring_and_synthesis(question, seed_facts, graph_data, top_k, expanded_query)
             ctx["answer_len"] = len(answer)
             return answer
 
@@ -263,19 +265,6 @@ class HybridRetrievalEngine:
             # fact at a time. A plain (non-UNWIND) MATCH ... OPTIONAL MATCH ...
             # RETURN is fine — only the UNWIND-prefixed combined form was ever
             # rejected.
-            node_cypher = """
-            MATCH (f {id: $fid})
-            OPTIONAL MATCH (f)-[:ABOUT]->(e)
-            RETURN
-                f.text AS text,
-                f.speaker AS speaker,
-                f.valid_from AS valid_from,
-                f.valid_to AS valid_to,
-                f.observed_at AS observed_at,
-                f.superseded_at AS superseded_at,
-                f.memory_scope AS memory_scope,
-                e.logical_key AS entity_key
-            """
             raw_nodes = []
             entity_key_by_fact: dict[str, str] = {}
             for fact_key, graph_id in graph_id_by_fact_key.items():
@@ -293,7 +282,9 @@ class HybridRetrievalEngine:
                     e.logical_key AS entity_key
                 """
                 try:
-                    rows = self._hydra.read(node_cypher, {"fid": graph_id}, None)
+                    # graph_id is inlined above (int()-coerced, so not injectable);
+                    # no parameters remain to bind.
+                    rows = self._hydra.read(node_cypher, {}, None)
                 except Exception as e:
                     logger.warning("HydraDB node query error for %s: %s", fact_key, e)
                     continue
@@ -368,9 +359,24 @@ class HybridRetrievalEngine:
             path_count_by_fact = {}
             hop_count_by_fact = {}
 
-            # 2. Execute algo.MSpaths
+            # 2. Execute algo.MSpaths.
+            #
+            # Values are inlined rather than parameterized because this HydraDB
+            # build rejects a list parameter here outright ("composite parameter
+            # $entities is only supported as an UNWIND input", confirmed live),
+            # so `$entities` is not an option for this call.
+            #
+            # Escaping via json.dumps, not a hand-rolled quote-doubler. Doubling
+            # only `'` leaves backslashes untouched, and an entity ending in one
+            # produces `'ent\'` -- the backslash escapes the closing quote, the
+            # literal never terminates, and the rest of the query is swallowed.
+            # That input is reachable: entity names come from LLM extraction of
+            # user content, and `canonicalize_entity_surface` only NFKC-
+            # normalizes, collapses whitespace, and casefolds -- it strips
+            # neither backslashes nor quotes. json.dumps emits a correctly
+            # escaped double-quoted literal, which Cypher accepts.
             if entities:
-                escaped_entities = ", ".join(f"'{e.replace("'", "''")}'" for e in entities)
+                escaped_entities = ", ".join(json.dumps(e) for e in entities)
                 path_cypher = f"""
                 CALL algo.MSpaths({{
                     sourceLabel: 'Entity',
@@ -406,6 +412,10 @@ class HybridRetrievalEngine:
                 entity_key = entity_key_by_fact.get(fact_key)
                 entity_fact_count = len(entity_to_facts.get(entity_key, ())) if entity_key else 0
                 graph_data[f_id] = {
+                    # Carried through so scoring can apply the entity boost only
+                    # to entities the *query* actually mentions, per
+                    # FINAL_ARCHITECTURE.md's `if entity in query_entities`.
+                    "entity_key": entity_key,
                     "hop_count": hop_count_by_fact.get(fact_key, 1),
                     "path_count": path_count_by_fact.get(fact_key, 0),
                     "entity_fact_count": entity_fact_count,
@@ -413,13 +423,25 @@ class HybridRetrievalEngine:
 
             return graph_data
 
+    def _query_entity_terms(self, question: str, expanded_query: QueryRewriterOutput | None) -> set[str]:
+        """Lowercased tokens from the question (and its rewritten forms) used to
+        decide whether a fact's linked entity is one the *query* mentions."""
+        parts = [question]
+        if expanded_query is not None:
+            parts.extend(expanded_query.synonyms)
+            parts.extend(expanded_query.decomposed_queries)
+        text = " ".join(parts).casefold()
+        return {token for token in re.findall(r"[a-z0-9]+", text) if len(token) > 2}
+
     def _composite_scoring_and_synthesis(
-        self, question: str, facts: dict[str, ScoredFact], graph_data: dict, top_k: int
+        self, question: str, facts: dict[str, ScoredFact], graph_data: dict, top_k: int,
+        expanded_query: QueryRewriterOutput | None = None,
     ) -> str:
         with timed_operation(logger, "retrieval.phase3.scoring_and_synthesis", {"facts_to_score": len(facts)}) as ctx:
             path_cap = self._config.retrieval_structural_path_cap
             boost_cap = self._config.retrieval_entity_boost_cap
             divisor = self._config.retrieval_composite_score_divisor
+            query_terms = self._query_entity_terms(question, expanded_query)
 
             for f_id, fact in facts.items():
                 g = graph_data.get(f_id, {"hop_count": 1, "path_count": 0, "entity_fact_count": 0})
@@ -428,7 +450,28 @@ class HybridRetrievalEngine:
                 entity_fact_count = g.get("entity_fact_count", 0)
 
                 fact.structural_score = (1.0 / hop_count) * min(path_count, path_cap) / path_cap
-                fact.entity_boost = boost_cap if entity_fact_count > 0 else 0.0
+
+                # Boost only entities the QUERY mentions -- FINAL_ARCHITECTURE.md
+                # §"Entity boost" gates on `if entity in query_entities`, and
+                # dropping that gate is not a small deviation: it hands the same
+                # flat boost to every entity-linked fact in the corpus.
+                # Measured on LongMemEval 118b2229 ("How long is my daily
+                # commute to work?"): the gold fact carried the single highest
+                # semantic score of all 113 seeds (0.716) but has no entity
+                # link, so it scored 0.231 and ranked #39, while 15 unrelated
+                # bike-training facts (semantic 0.58-0.69) each took +0.50 and
+                # filled the entire top-15 the reader ever sees. The boost is
+                # worth ~3x the entire spread of semantic scores, so ungated it
+                # does not tie-break, it overrides.
+                entity_key = g.get("entity_key") or ""
+                canonical = entity_key.split(":", 1)[-1].casefold()
+                entity_matches_query = bool(canonical) and any(
+                    token in query_terms for token in re.findall(r"[a-z0-9]+", canonical) if len(token) > 2
+                )
+                if entity_fact_count > 0 and entity_matches_query:
+                    fact.entity_boost = min(boost_cap / max(entity_fact_count, 1), boost_cap)
+                else:
+                    fact.entity_boost = 0.0
 
                 fact.composite_score = (fact.semantic_score + fact.keyword_score + fact.structural_score + fact.entity_boost) / divisor
 

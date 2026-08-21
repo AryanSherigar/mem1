@@ -226,8 +226,23 @@ class GraphPlanBuilder:
         )
 
     def _speaker_entity_node(self, chunk: Chunk) -> GraphNode:
+        """The speaker gets its own `speaker:` key namespace, deliberately not
+        `entity:{role}`.
+
+        Sharing the `entity:` namespace made this node collide with an ordinary
+        extracted entity of the same name: the extractor genuinely emits
+        "user"/"assistant" as entity surfaces, which canonicalize to the same
+        `entity:assistant` logical_key and therefore the same allocated
+        graph_id, but carry `entity_type="other"` instead of `"speaker"`. Same
+        key, same id, different payload -- `PostgresGraphManifestStore` rejects
+        that by design, and it aborted a real LongMemEval ingestion run with
+        `GraphPayloadConflictError: node entity:assistant has a different
+        immutable graph payload`. Separating the namespaces removes the whole
+        collision class rather than trying to reconcile two payloads that
+        legitimately differ.
+        """
         role = chunk.actor_role or "unknown"
-        logical_key = f"entity:{role}"
+        logical_key = f"speaker:{role}"
         graph_id = self._allocator.allocate_graph_id("entity", chunk.context_id, logical_key)
         return GraphNode(
             graph_id, "Entity", logical_key,

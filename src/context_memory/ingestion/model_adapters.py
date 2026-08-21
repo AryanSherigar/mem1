@@ -69,7 +69,17 @@ class LLMEntityResolutionModel:
                 )
                 ctx["selected_id"] = result.selected_graph_id
                 return result.selected_graph_id
-            except LLMClientError as error:
+            except Exception as error:
+                # Was `except LLMClientError` only, which does not catch
+                # openai.APITimeoutError (a different exception hierarchy) --
+                # confirmed live: a single slow call propagated straight out of
+                # this bounded-decision port, past graph_plan_builder's loop,
+                # and aborted the *entire chunk* via orchestrator.run_chunk's
+                # generic except, losing every fact in that turn over one
+                # resolution timing out. This port's contract is already
+                # "return None on any doubt" (EntityRegistry.resolve treats
+                # UNRESOLVED as no-forced-link, never invents a candidate); a
+                # provider timeout is exactly that kind of doubt.
                 logger.warning("Entity resolution model error for surface %r: %s", surface, error)
                 return None
 
@@ -97,7 +107,20 @@ class LLMTemporalUpdateModel:
                 )
                 ctx["classified_relation"] = result.relation
                 return TemporalRelation(result.relation)
-            except LLMClientError as error:
+            except Exception as error:
+                # Was `except LLMClientError` only. Confirmed live during a
+                # 30-instance demo run: openai.APITimeoutError from Bedrock
+                # propagated straight out of this bounded-decision port and
+                # aborted the whole chunk via orchestrator.run_chunk's generic
+                # except -- 42 timeouts in one instance, each one losing every
+                # fact in that turn (not just the one supersession check) and
+                # costing up to timeout x (sdk_max_retries+1) of wall clock
+                # before the exception even surfaced. UNRESOLVED is this
+                # port's existing "no clear basis to decide" outcome
+                # (TemporalUpdateClassifier gates SUPERSEDES on
+                # CORRECTION/STATE_CHANGE only), so a provider timeout
+                # degrading to it is the contract working as designed, not a
+                # new behavior.
                 logger.warning("Temporal update classification error: %s", error)
                 return TemporalRelation.UNRESOLVED
 

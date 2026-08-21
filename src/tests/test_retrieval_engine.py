@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -86,10 +87,17 @@ class FakeHydra:
         return []
 
 class FakeHydraWithEntities:
-    """Like FakeHydra but resolves OPTIONAL MATCH's entity_key per-$fid, so a
+    """Like FakeHydra but resolves OPTIONAL MATCH's entity_key per fact id, so a
     test can control which facts share an entity vs which don't -- needed to
     exercise entity_fact_count actually varying (it used to be hardcoded to 1
-    for every fact, so entity_boost was a constant regardless of fixture)."""
+    for every fact, so entity_boost was a constant regardless of fixture).
+
+    The id is parsed out of the query text rather than read from `params`:
+    retrieval.py inlines it as `MATCH (f {id: 123})` (int()-coerced) because
+    this HydraDB build's parameter support is too narrow, so there is no bound
+    parameter left to inspect."""
+
+    _ID_PATTERN = re.compile(r"MATCH \(f \{id: (\d+)\}\)")
 
     def __init__(self, entity_key_by_fid):
         self.entity_key_by_fid = entity_key_by_fid
@@ -98,7 +106,8 @@ class FakeHydraWithEntities:
         if "SUPERSEDES" in cypher:
             return []
         if "OPTIONAL MATCH" in cypher:
-            fid = params.get("fid")
+            match = self._ID_PATTERN.search(cypher)
+            fid = int(match.group(1)) if match else None
             return [{
                 "text": None, "speaker": None,
                 "valid_from": 0, "valid_to": 9999999999,
@@ -170,33 +179,50 @@ class TestRetrievalEngine(unittest.TestCase):
         ans = engine.retrieve_and_answer("ctx-1", "where is dog?", datetime.now(timezone.utc))
         self.assertEqual(ans, "The dog is in the park")
 
-    def test_entity_boost_reflects_real_inverse_frequency(self):
-        """entity_fact_count used to be hardcoded to 1 for every fact, so
-        entity_boost (retrieval_entity_boost_cap / entity_fact_count) was the
-        same constant (the cap) for every fact regardless of the graph --
-        one of composite scoring's four signals contributed nothing to
-        ranking. Two facts sharing an entity should now get a smaller boost
-        than a fact whose entity is unique to it."""
+    def test_entity_boost_applies_only_to_entities_the_query_mentions(self):
+        """FINAL_ARCHITECTURE.md's entity boost gates on
+        `if entity in query_entities`. Dropping that gate gave the same flat
+        boost to every entity-linked fact in the corpus, and because the boost
+        (0.5) is worth roughly 3x the entire spread of semantic scores, it
+        overrode relevance instead of tie-breaking it.
+
+        Measured on LongMemEval 118b2229 ("How long is my daily commute to
+        work?"): the gold fact had the single highest semantic score of all 113
+        seeds (0.716) but no entity link, so it ranked #39 while 15 unrelated
+        bike-training facts took +0.50 each and filled the entire top-15."""
         llm = FakeLLMClient([])
         conn = FakeConnection(registry_rows=[("fact:fact-1", 1), ("fact:fact-2", 2), ("fact:fact-3", 3)])
-        hydra = FakeHydraWithEntities({1: "entity-common", 2: "entity-common", 3: "entity-rare"})
+        # fact-1/fact-2 link to "commute"; fact-3 has no entity at all.
+        hydra = FakeHydraWithEntities({1: "entity:commute", 2: "entity:commute", 3: None})
         engine = HybridRetrievalEngine(llm, FakeEmbedder(), conn, hydra)
 
-        seed_facts = {
-            "fact-1": ScoredFact("fact-1", "shared A"),
-            "fact-2": ScoredFact("fact-2", "shared B"),
-            "fact-3": ScoredFact("fact-3", "unique"),
-        }
-        graph_data = engine._hydradb_graph_expansion("ctx-1", seed_facts, DateRange(), datetime.now(timezone.utc))
+        def fresh_seeds():
+            return {
+                "fact-1": ScoredFact("fact-1", "linked A"),
+                "fact-2": ScoredFact("fact-2", "linked B"),
+                "fact-3": ScoredFact("fact-3", "unlinked"),
+            }
 
+        seed_facts = fresh_seeds()
+        graph_data = engine._hydradb_graph_expansion("ctx-1", seed_facts, DateRange(), datetime.now(timezone.utc))
         self.assertEqual(graph_data["fact-1"]["entity_fact_count"], 2)
-        self.assertEqual(graph_data["fact-2"]["entity_fact_count"], 2)
-        self.assertEqual(graph_data["fact-3"]["entity_fact_count"], 1)
+        self.assertEqual(graph_data["fact-3"]["entity_fact_count"], 0)
+        self.assertEqual(graph_data["fact-1"]["entity_key"], "entity:commute")
 
         cap = engine._config.retrieval_entity_boost_cap
-        shared_boost = min(cap / 2, cap)
-        unique_boost = min(cap / 1, cap)
-        self.assertLess(shared_boost, unique_boost)
+
+        # Query mentions the entity -> boost applies, inverse-frequency scaled.
+        engine._composite_scoring_and_synthesis(
+            "how long is my commute?", seed_facts, graph_data, top_k=5)
+        self.assertEqual(seed_facts["fact-1"].entity_boost, min(cap / 2, cap))
+        self.assertEqual(seed_facts["fact-3"].entity_boost, 0.0)
+
+        # Query does NOT mention it -> no boost, even though the fact is linked.
+        unrelated = fresh_seeds()
+        engine._composite_scoring_and_synthesis(
+            "what laptop should I buy?", unrelated, graph_data, top_k=5)
+        self.assertEqual(unrelated["fact-1"].entity_boost, 0.0)
+        self.assertEqual(unrelated["fact-3"].entity_boost, 0.0)
 
     def test_abstention_no_longer_ignores_strong_keyword_match(self):
         """A fact found purely by keyword match (weak/no embedding similarity,

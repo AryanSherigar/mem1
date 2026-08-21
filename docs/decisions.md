@@ -3,9 +3,9 @@
 | Field | Value |
 |---|---|
 | Status | Living, append-only decision history |
-| Last verified | 2026-08-19 against local HTTP Docker write/read smoke, PostgreSQL manifest implementation, deterministic M7 embedding/model-adapter unit suite, and a hosted HydraDB v2 sandbox investigation (ADR-026) |
-| Next review | Milestone 8 approval packet |
-| Roadmap | [ingestion_pipeline_roadmap.md](ingestion_pipeline_roadmap.md) |
+| Last verified | 2026-08-20 against live end-to-end runs on Groq (ADR-033), a live SUPERSEDES edge creation + scoring fix verification (ADR-034/035), and a working local web UI against the running FastAPI server (ADR-036) |
+| Next review | Post-hackathon-submission follow-up, if the project continues |
+| Roadmap | See [FINAL_ARCHITECTURE.md](../FINAL_ARCHITECTURE.md) for the current, accepted system design. `ingestion_pipeline_roadmap.md` and other milestone-tracking docs, plus the duplicate/redundant architecture docs, were removed once their milestones completed (ADR-037, ADR-038; `docs/fixtures/` excepted — still a live test dependency) — recoverable from git history. |
 
 ## 1. Governance
 
@@ -56,6 +56,13 @@ Every material entry records why, tradeoffs, consequences, revisit triggers, and
 | ADR-029 | Fireworks + deepseek-v4-flash as the M5 model provider | Accepted | 2026-08-19 |
 | ADR-030 | Candidate-to-graph-plan mapping; SUPERSEDES deferred pending predicate_key | Accepted | 2026-08-19 |
 | ADR-031 | M8 job state machine: whole-chunk idempotent replay, not per-stage resumption | Accepted | 2026-08-19 |
+| ADR-032 | HydraDB built locally from vendored source instead of pulling a published image | Accepted | 2026-08-20 |
+| ADR-033 | Groq + qwen3.6-27b replaces Fireworks as default provider; every tunable centralized in `core/config.py` | Accepted (supersedes ADR-029's default) | 2026-08-20 |
+| ADR-034 | SUPERSEDES wiring activated in the real ingestion path | Accepted (closes the gap left open by ADR-030) | 2026-08-20 |
+| ADR-035 | Retrieval composite-scoring fixes and ~59% per-call token reduction | Accepted | 2026-08-20 |
+| ADR-036 | React + Vite web UI with live SSE graph streaming | Accepted | 2026-08-20 |
+| ADR-037 | Milestone-tracking/planning docs removed post-completion for the hackathon submission | Accepted | 2026-08-21 |
+| ADR-038 | Single architecture document (`FINAL_ARCHITECTURE.md`); `ARCHITECTURE.md` and duplicate `docs/FINAL_ARCHITECTURE.md` removed | Accepted (corrects ADR-037's "keep `ARCHITECTURE.md`" consequence) | 2026-08-21 |
 
 ## 3. Accepted Decisions
 
@@ -654,3 +661,136 @@ The state-transition table was generalized from the contract's single documented
 **Verification:** `src/tests/test_job_transitions.py` (11 tests, pure state-table logic, every table row plus the generalized skip-ahead/idempotent-replay rule). `src/tests/test_orchestrator.py` (6 tests, fakes only): happy path reaches `completed` and writes the expected graph/embedding shape; zero-candidate chunk still completes; a transient failure produces `retryable_failed` and a second call succeeds; a `completed` job is never reprocessed; a `terminal_failed` job blocks auto-retry. `PostgresJobStore` verified against real PostgreSQL: lifecycle to `completed`, `seed` idempotency (does not reset progress), illegal-transition rejection, `attempt_count` increment on failure.
 
 **Revisit trigger:** Retry cost (re-running extraction/graph-write/embeddings on every retry) is measured and found too expensive, motivating `ExtractionStore`/`EmbeddingStore` read-back ports and true per-stage resumption as a follow-up ADR.
+
+### ADR-032 — HydraDB Built Locally from Vendored Source Instead of a Published Image
+
+**Status:** Accepted
+**Date:** 2026-08-20
+
+**Decision:** `compose.yaml`'s `hydradb` service builds from the vendored `hydradb/` source tree (`build: { context: ./hydradb, dockerfile: Dockerfile, target: runtime }`) rather than pulling a published image tag. The container entrypoint generates the local auth-token file the running instance actually uses and starts `graph-node` against named Docker volumes (`hydradb_store`, `hydradb_cache`) so graph state survives a container restart instead of resetting to empty each time.
+
+**Why:** A pulled image floats: its exact commit, patch level, and Cypher-compat surface are opaque and can silently drift out from under the application between local runs. Building from the vendored source (already checked in per ADR-023) pins the exact engine version the rest of this project was written and tested against, and named volumes make local iteration usable — restarting the stack to pick up a Python-side change no longer means re-ingesting everything from scratch.
+
+**Alternatives:** Keep pulling `latest` — rejected, it is the source of the drift risk this decision closes. Bind-mount an ephemeral tmpfs for graph storage — rejected, that was the prior behavior and made every `docker compose down`/`up` cycle during development destroy all graph state, which is expensive when verifying ADR-034's live SUPERSEDES behavior.
+
+**Tradeoffs / hold-ons:** Local builds are slower on first run (compiling the Rust engine) than pulling a cached image layer. No image-signing/provenance story exists for the locally-built image; acceptable for a hackathon/local-dev posture, not evaluated for a production deployment.
+
+**Consequences:** `compose.yaml` requires the `hydradb/` source tree to be present and buildable (Rust 1.91+ toolchain inside the build stage, per `hydradb/rust-toolchain.toml`) rather than only requiring a Docker daemon and network access to a registry.
+
+**Verification:** `docker compose up -d` builds and starts both services healthy; confirmed live alongside ADR-034/035's end-to-end verification runs, with graph state observed to persist across a container restart.
+
+**Revisit trigger:** The vendored `hydradb/` source falls behind upstream in a way that matters (a needed Cypher feature or bugfix), motivating a return to a published/pinned image tag instead of vendored source.
+
+### ADR-033 — Groq + qwen3.6-27b Replaces Fireworks as Default Provider; Tunables Centralized in `core/config.py`
+
+**Status:** Accepted (supersedes ADR-029's default provider/model choice)
+**Date:** 2026-08-20
+
+**Decision:** Default LLM provider changes from Fireworks `deepseek-v4-flash` (ADR-029) to Groq `qwen/qwen3.6-27b` with `reasoning_effort=none`. Every tunable value and system prompt in the pipeline — per-role model/endpoint/credential, per-role token/timeout budgets, retrieval scoring constants, ingestion concurrency, and storage/transport settings — moves into `core/config.py`'s `Config` dataclass as the single dial point; `api/routes.py::get_engine()` now builds one `Config()` instead of reading `os.environ` directly at scattered call sites. Env var names are generalized to `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`, with `FIREWORKS_*` retained only as a fallback so existing `.env` files keep working.
+
+**Why:** Measured live on the real extraction workload: Fireworks' `deepseek-v4-flash` cold-started at 226s for an 11-token prompt and returned empty completions whenever hidden reasoning exhausted its output budget (`finish_reason=length`, `content=''`) — a systematic defect, not an occasional blip. Groq's `qwen3.6-27b` is the one model on that endpoint accepting `reasoning_effort="none"` (genuinely no hidden reasoning): 0.17s vs 0.50–0.76s per call, 36 completion tokens vs 160–330. This isn't only a speed win — the same call *with* reasoning left on returns HTTP 400 "Failed to validate JSON" because reasoning text corrupts the JSON body, so disabling it also fixes a correctness bug. Centralizing tunables closes a real drift risk the old scattered-`os.environ` approach had already caused once (`benchmark_runner.py` was found building its LLM client from legacy `FIREWORKS_BASE_URL`/`EXTRACTOR_MODEL` names directly, predating `Config`'s provider-neutral names — see ADR-035 — so it silently kept sending Fireworks requests during "Groq" pilot runs).
+
+**Alternatives:** Keep Fireworks as default and treat the empty-completion failures as a retry-policy problem only — rejected; a model that can return empty content after 226s under normal (non-adversarial) load is not a sound default regardless of retry wrapping. Leave tunables distributed across call sites — rejected; that's the exact condition that let `benchmark_runner.py` drift from `routes.py`'s actual configuration undetected.
+
+**Tradeoffs / hold-ons:** `gpt-oss`-family models on the same Groq endpoint only accept `low`/`medium`/`high` reasoning effort (cannot be turned off at all), so the `reasoning_effort=none` win is specific to `qwen3.6-27b`, not a general Groq property — switching models later requires re-checking this. The OpenAI SDK's own `max_retries` (previously left at its default of 2, silently tripling every timeout — a 45s cap produced a measured 163947ms call) is now set explicitly per client; a bounded retry on empty/unparseable structured output was added, doubling the token budget only when `finish_reason` was genuinely `length`.
+
+**Consequences:** `core/config.py` gains `_role_base_url`/`_role_api_key`/`_role_model` helpers and per-role fields for six roles (entity resolution, temporal update, extractor, reader, temporal resolver, query rewriter), each independently env-overridable. `src/.env.example` added, documenting required credentials and the explicit `set -a && source src/.env && set +a` load step (config still never auto-loads `.env`, per ADR-027's fix). Two correctness bugs surfaced and fixed while running the pipeline end-to-end under the new default: `graph_plan_builder`'s `Session` node derived properties from the current chunk instead of staying stable across turns (every 2nd turn in a session hard-failed with `GraphPayloadConflictError`), and HydraDB rejects UNWIND-batched reads, so Phase 2 retrieval now issues per-fact reads matching the original design.
+
+**Verification:** Live end-to-end pipeline run against Groq; 122 tests passing with fakes updated for the new client kwargs. Confirmed via measured per-call latency/token counts cited above.
+
+**Revisit trigger:** A future model on any provider offers genuinely-disabled reasoning with better structured-output reliability at comparable or better latency/cost; or Groq's rate limits/availability become a measured blocker.
+
+### ADR-034 — SUPERSEDES Wiring Activated in the Real Ingestion Path
+
+**Status:** Accepted (closes the gap ADR-030 left open)
+**Date:** 2026-08-20
+
+**Decision:** `ingestion/fact_lookup.py::HydraFactLookup` is added as the real `find_existing_facts` data source and constructed in both production entrypoints (`api/routes.py`, `evaluation/benchmark_runner.py`); previously only a test ever supplied this callback, so the `SUPERSEDES`-edge-creation block in `graph_plan_builder.py` was permanently dead code and `LLMTemporalUpdateModel` (built and unit-tested since ADR-020, live-verified since ADR-029) was never invoked in production. Two supporting fixes were required for supersession to actually work end-to-end: `Fact` nodes now carry `predicate_key` as a graph property (the "active facts for this subject+predicate" lookup had nothing to filter on without it), and `PostgresGraphManifestStore` now allows `is_current`/`superseded_at`/`valid_to` to change on an already-registered node (supersession can only build a partial node for the prior fact — `graph_plan_builder` holds a `FactState`, not the original full `GraphNode` — so the previous strict whole-payload immutability check hard-failed every supersession with the same conflict error the Session-node bug in ADR-033 produced; any field outside this fixed allow-list still hard-conflicts, preserving the original immutability guarantee everywhere else). The existing-facts lookup also no longer requires `action == UPDATE`: confirmed live, `LLMExtractor` sees only the current turn with no prior-facts context and labelled "Max moved to Seattle." as `ADD` immediately after "Max lives in Boston." in the same context — gating supersession on the extractor's own action guess meant it only fired when the model happened to phrase things as an explicit correction. `TemporalUpdateClassifier` (ADR-020) already exists specifically to make this judgment properly and can itself return `NO_UPDATE`; only `DELETE` actions are now excluded from the lookup.
+
+**Why:** ADR-030 deferred `SUPERSEDES` on the stated belief that `ExtractedMemoryCandidate` carried "free text only, no subject/predicate/object decomposition." That was already inaccurate by the time of this fix — `predicate_key` has existed on the candidate/draft models since the M5 work (ADR-020) — the actual blocker was integration wiring (no caller ever supplied `find_existing_facts`) and two downstream storage assumptions (missing graph property, overly strict manifest immutability), not missing extraction structure. This ADR corrects the record and closes the gap with the mechanism ADR-030 said didn't exist yet.
+
+**Alternatives:** Re-derive a predicate heuristic as ADR-030 considered and rejected — moot, since `predicate_key` was already present; the real fix was wiring, not extraction. Require `action == UPDATE` as a gate (the original design) — rejected per the live-confirmed extractor behavior above; it made supersession's actual trigger rate depend on the extractor's unreliable self-classification instead of the purpose-built classifier.
+
+**Tradeoffs / hold-ons:** Supersession quality is now bounded by `TemporalUpdateClassifier`'s classification accuracy (correction vs. state-change vs. no-update vs. unresolved) rather than by whether the wiring exists at all — that's the intended tradeoff, but it means bad classifications now have a live effect on the graph (a wrongly-fired `SUPERSEDES` edge) where before they simply couldn't happen.
+
+**Consequences:** ADR-030's "SUPERSEDES deferred" scope note is superseded; the builder now actively creates `(new:Fact)-[:SUPERSEDES]->(old:Fact)` edges and closes the old fact's `superseded_at`/`is_current` per §11 of `FINAL_ARCHITECTURE.md`. `PostgresGraphManifestStore`'s mutable-field allow-list is a new, narrow exception to the immutable-graph-manifest guarantee from ADR-021 — every other field remains a hard conflict.
+
+**Verification:** Confirmed live end-to-end: a `SUPERSEDES` edge was created and the prior fact's `is_current` flipped to `False`. New/updated test coverage in `src/tests/test_graph_plan_builder.py` for the manifest mutable-field allowance and edge creation under the relaxed `action` gate.
+
+**Revisit trigger:** `TemporalUpdateClassifier`'s live false-positive/false-negative rate on real conversational corrections vs. genuine state changes is measured and found to need prompt or threshold tuning.
+
+### ADR-035 — Retrieval Composite-Scoring Fixes and ~59% Per-Call Token Reduction
+
+**Status:** Accepted
+**Date:** 2026-08-20
+
+**Decision:** Three scoring defects in the Phase 3 composite score (§12 of `FINAL_ARCHITECTURE.md`) are fixed: (1) `entity_boost` was effectively a constant because `entity_fact_count` was hardcoded to `1` for every fact, always producing the cap value — it now uses the real per-entity fact count already computed during Phase 2 graph expansion, so entity boost can actually vary and affect ranking. (2) The abstention gate ignored `keyword_score`, so a strong BM25-only match with weak embedding similarity could still abstain — abstention now considers both signals. (3) BM25 search now falls back to the raw question when the query rewriter returns nothing, instead of silently skipping keyword search for the whole request (the rewriter shares an LLM path that can fail on credentials/timeouts independently of the main query). Separately, per-call token overhead is cut: response shape is described to the model as a compact TypeScript/BAML-style typedef instead of full JSON Schema (839 → 225 chars measured on the extraction schema; `response_format` still enforces JSON provider-side, only the shape description changes; `LLM_SCHEMA_FORMAT=json_schema` reverts it), schema noise keys are stripped, and the extraction prompt no longer re-describes fields the schema already declares. A rate-limit-aware 429 retry is also added — a 429 raises out of the SDK's `.create()` and so never reached the existing empty-content retry loop, meaning rate-limited extractions previously failed outright and silently dropped that turn's facts (confirmed against Groq's 8k TPM free tier); the new retry honors the provider's stated `Retry-After` with jitter so concurrent prefetch workers don't all re-trip the limit at once.
+
+**Why:** Found by auditing what the pipeline actually does at runtime versus its designed behavior — several headline features were wired but inert or partially broken. Measured on a real LongMemEval instance: fixed per-call overhead (system prompt + schema) was 2237 chars against 882 mean turn-content chars — 71% boilerplate — and Groq reports no prompt caching (verified live: identical prompts billed at full price twice, no `cached_tokens` field), so nothing amortizes that cost across calls; it is pure throughput loss under a tokens-per-minute rate limit.
+
+**Alternatives:** Leave `entity_boost` uncomputed until real per-entity counts were plumbed through as a separate change — rejected; the count was already being computed in Phase 2 and simply not passed through, a one-line-scope fix, not a design change. Cap token savings to noise-key stripping only, without the typedef format change — rejected; typedef was the larger single reduction (614 of the 614-char JSON-Schema-vs-noise-stripped gap) and `LLM_SCHEMA_FORMAT` keeps `json_schema` available as an escape hatch if a provider's structured-output validator needs real JSON Schema.
+
+**Tradeoffs / hold-ons:** `benchmark_runner.py` was found measuring a materially weaker system than production in two ways while this area was being audited: it passed `model=None` to `EntityRegistry` (disabling LLM entity resolution, exact-match only) while `routes.py` passes a real model, and it built its LLM client from legacy env names predating `Config`'s provider-neutral ones (see ADR-033) — both are fixed as part of this same pass so the benchmark now measures what production actually runs, but any benchmark numbers collected before this ADR should be treated as measuring a different, weaker configuration.
+
+**Consequences:** Net measured effect: fixed per-call overhead 2237 → 908 chars (−59%), overhead share of a typical call 71% → 50%, and a 550-turn benchmark instance drops from ~476k to ~273k prompt tokens (−42%, matching the commit's headline number). Embeddings are now batched in the ingestion orchestrator when the embedder supports it (measured 5.1ms/text one-at-a-time vs 1.1ms batched; falls back to per-item calls for embedders that don't support batching, since `Embedder` is a Protocol). `--extraction-workers` in `benchmark_runner.py` is now clamped rate-limit-aware, since the real ceiling is tokens/minute, not open connections.
+
+**Verification:** 139 tests passing (up from 126): new coverage for the 429 retry (and confirmation non-429 errors are *not* retried), schema compaction, the manifest mutable-field allowance (shared with ADR-034), `entity_boost` actually varying across facts, and both the keyword-inclusive-abstention and BM25-fallback paths. Token counts measured live against a real LongMemEval instance.
+
+**Revisit trigger:** A provider adds real prompt caching (changes the token-reduction cost/benefit calculus), or the typedef schema format is found to reduce structured-output reliability on some model and needs to default back to `json_schema`.
+
+### ADR-036 — React + Vite Web UI with Live SSE Graph Streaming
+
+**Status:** Accepted
+**Date:** 2026-08-20
+
+**Decision:** Add a React + Vite frontend (`frontend/`) as a new client layer, not a replacement for the CLI/REST entrypoints: a chat pane (`ChatPane.tsx`) posts to the existing `POST /v1/chat` endpoint, and a live, force-directed graph pane (`GraphPane.tsx`) renders the HydraDB graph in real time. `api/server.py` monkey-patches `GraphWriter.write` to additionally broadcast every plan it sends to HydraDB over a new Server-Sent Events endpoint (`GET /v1/memory/stream`, implemented in the new `api/stream.py`), which the graph pane subscribes to. Two demo-support endpoints are added (`POST /v1/demo/simulate`, `POST /v1/demo/clear`) to drive a scripted conversation and reset memory from the UI without a separate script.
+
+**Why:** The retrieval/ingestion mechanics this project's earlier ADRs establish (bitemporal SUPERSEDES, multi-hop `algo.MSpaths` expansion, entity resolution) are otherwise only observable through logs or `curl` output. A live graph view makes the actual write-time behavior — nodes and edges appearing as facts are extracted — directly demonstrable, which matters for a project whose main claims are about *what the graph does*, not just what the API returns.
+
+**Alternatives:** Poll a REST endpoint for graph state on an interval instead of SSE — rejected; polling either lags visibly or wastes requests, and the write path already has a single natural broadcast point (`GraphWriter.write`) that SSE fits directly. Build the graph view as a separate standalone tool outside the main app — rejected; coupling it to the same FastAPI process and the same live chat session is what makes the demo effect work.
+
+**Tradeoffs / hold-ons:** The monkey-patch on `GraphWriter.write` is a pragmatic hook, not a designed extension point — a future refactor of `GraphWriter` needs to preserve or replace this broadcast call explicitly, it will not survive an unrelated rewrite silently. CORS is currently wide open (`allow_origins=["*"]`) for local development convenience; this is a local-demo posture, not evaluated for any non-local deployment. The frontend hardcodes `http://localhost:8000` for the chat/demo endpoints when served from Vite's dev server (port 5173), falling back to relative paths only when not on that port — deploying the frontend and backend on different hosts needs this made configurable.
+
+**Consequences:** New `frontend/` package (React 19, Vite 8, TypeScript) with its own `package.json`/`npm install` step, documented in the README's setup instructions. `api/server.py` gains CORS middleware and the SSE stream endpoint; `api/stream.py` is a new small in-process pub/sub broadcaster (per-connection `asyncio.Queue`, keepalive on a 1s timeout) with no persistence — a client that connects after a write has already happened does not see historical events, only new ones.
+
+**Verification:** Manual run: backend on `:8000`, frontend dev server on `:5173`, chat messages sent through the UI produce visible graph updates in the connected browser tab within the SSE round-trip.
+
+**Revisit trigger:** A non-local (multi-host) deployment is needed, requiring the hardcoded backend URL and open CORS policy to become real configuration; or SSE's no-history-on-reconnect behavior is found to matter for a real usage pattern (would motivate a durable event log instead of an in-memory queue).
+
+### ADR-037 — Milestone-Tracking/Planning Docs Removed Post-Completion for the Hackathon Submission
+
+**Status:** Accepted
+**Date:** 2026-08-21
+
+**Decision:** Remove the milestone-scoped planning and tracking documents that guided this project's incremental build process — `NEXT_STEPS.md`, `AGENT.md`, `AGENTS.md`, `docs/architecture_flow_comparison.md`, `docs/architecture_plan.md`, `docs/entity_resolution_strategy.md`, `docs/extraction_baseline.md`, `docs/graph_schema_proposal.md`, `docs/ingestion_contract_v1.md`, `docs/ingestion_pipeline_roadmap.md`, `docs/ingestion_structure.md`, `docs/llm_model_config.md`, `docs/retrieval_architecture.md`, `docs/semantic_memory_distillation.md`, `docs/startup_hydration_id_generation.md`, and `docs/temporal_query_resolver.md` — from the working tree ahead of the hackathon submission. `docs/fixtures/` was initially removed in the same pass but restored on discovering `src/tests` loads those JSON files at runtime (`generic_context_batch_v1.json`, `longmemeval_adapter_input_v1.json`, and their siblings are live test fixtures, not planning artifacts, despite living in `docs/`) — it stays. `README.md`, `ARCHITECTURE.md`, `FINAL_ARCHITECTURE.md`, and this file (`docs/decisions.md`) remain as the complete, current description of the system: setup/run instructions and how HydraDB is used (`README.md`), a high-level architecture overview and doc index (`ARCHITECTURE.md`), the authoritative section-by-section specification (`FINAL_ARCHITECTURE.md`), and the full decision history with rationale (this file).
+
+**Why:** These documents were gated-milestone planning artifacts (approval packets, phase trackers, per-subsystem design-in-progress notes) for an incremental build process that has now completed — every decision and design point they captured either became an Accepted ADR in this log or is covered by `FINAL_ARCHITECTURE.md`'s authoritative specification. Left in place for a hackathon submission, they read as an unindexed pile of overlapping/historical design drafts (some already superseded once, per ADR-028) next to the actual current documentation, which is exactly the confusion ADR-028 already resolved once for a different but analogous set of documents.
+
+**Alternatives:** Keep them with superseded banners, as ADR-028 did for its set — rejected for the same reason ADR-028 itself gave: banners on a dozen-plus documents duplicate what a single removal note plus git history already provides, and unlike ADR-028's set, none of these were flagged as actively contradicting the accepted design (they simply became historical process artifacts). Fold salvageable content into `FINAL_ARCHITECTURE.md` or this log first — checked; nothing in the removed set contains a decision or design detail not already captured in an Accepted ADR here or in `FINAL_ARCHITECTURE.md`'s specification.
+
+**Tradeoffs / hold-ons:** Full text of every removed document remains recoverable from git history (`git log --follow -- <path>`) at the commit before this ADR; nothing is destroyed. `docs/decisions.md` prose written before this ADR still cites several of these paths as historical evidence (e.g. ADR-018 citing dataset-verification detail, ADR-030 citing `docs/ingestion_contract_v1.md`) — per this log's own governance rule (§1: "Accepted entries are historical records: do not rewrite their original decision or rationale"), those citations are left as-is rather than edited to point at nothing; the cited files remain retrievable via git history exactly as this paragraph describes.
+
+**Consequences:** The repository's top-level and `docs/` structure is reduced to: `README.md`, `ARCHITECTURE.md`, `FINAL_ARCHITECTURE.md`, `LICENSE`, `docs/decisions.md`, and `docs/fixtures/`, plus the actual source tree. No code, test, or currently-load-bearing documentation path referenced any of the sixteen removed markdown files (verified before removal); `docs/fixtures/` was checked separately and kept, since `src/tests` does load it.
+
+**Verification:** `git log --follow` on any removed path recovers full history. Repository builds, tests, and both entrypoints (FastAPI server, frontend dev server) are unaffected: `PYTHONPATH=src .venv/bin/python -m unittest discover -s src/tests` re-run after removal — 145 tests, all pass (20 skipped, credential-gated live tests) — confirming none of the removed markdown files were imported or read at runtime and that `docs/fixtures/` restoration was correct and sufficient.
+
+**Revisit trigger:** None expected; reopen only if a removed document's content is needed for a future audit — retrievable from git history without restoring it to the working tree.
+
+### ADR-038 — Single Architecture Document; `ARCHITECTURE.md` and Duplicate `docs/FINAL_ARCHITECTURE.md` Removed
+
+**Status:** Accepted (corrects ADR-037's "keep `ARCHITECTURE.md`" consequence)
+**Date:** 2026-08-21
+
+**Decision:** Remove `ARCHITECTURE.md` (root) and `docs/FINAL_ARCHITECTURE.md` — a byte-for-byte duplicate of the root `FINAL_ARCHITECTURE.md`, confirmed with `cmp -s` before removal and referenced by no code or doc path. `FINAL_ARCHITECTURE.md` (root) is kept as the single architecture document; it already states in its own header that it "Supersedes all prior architecture documents from both branches," which `ARCHITECTURE.md` was one instance of even after ADR-037 kept it as a shorter "overview + doc index." `README.md`'s repository map is updated to drop the `ARCHITECTURE.md` row.
+
+**Why:** Three files answering "what is the architecture" is itself the confusion ADR-028 and ADR-037 were both already trying to resolve for the surrounding document set — this pass missed two instances of the same problem within the architecture docs themselves. `ARCHITECTURE.md`'s content (system overview, graph schema summary, retrieval pipeline summary, entity resolution summary) is fully subsumed by `FINAL_ARCHITECTURE.md` §§1–2, 5, 10–12; nothing in it was unique. The `docs/` copy of `FINAL_ARCHITECTURE.md` was an exact duplicate with no divergence to preserve.
+
+**Alternatives:** Keep `ARCHITECTURE.md` as a shorter "quick read" entry point, as ADR-037 decided — rejected on reconsideration; a hackathon reviewer benefits more from exactly one architecture document to open than from choosing between a summary and the authoritative version, especially since `README.md` already carries its own "How HydraDB Is Used" summary section, making `ARCHITECTURE.md`'s overview role redundant with README too, not just with `FINAL_ARCHITECTURE.md`.
+
+**Tradeoffs / hold-ons:** `FINAL_ARCHITECTURE.md` is long (§1–20) with no shorter on-ramp document; `README.md`'s "How HydraDB Is Used" and "Key Features" sections now carry that on-ramp role instead. `hydradb/architecture.md` is untouched — it documents the vendored upstream HydraDB engine itself, not this project's architecture, and is out of scope here.
+
+**Consequences:** `README.md`'s repository-map code block no longer lists `ARCHITECTURE.md`. Both files this ADR removes were already git-tracked with clean history; `git log --follow -- ARCHITECTURE.md` / `-- docs/FINAL_ARCHITECTURE.md` recovers their content if ever needed.
+
+**Verification:** `cmp -s FINAL_ARCHITECTURE.md docs/FINAL_ARCHITECTURE.md` confirmed byte-identical before removal. `grep -rl` for both paths across `*.md`/`*.py` found no other reference.
+
+**Revisit trigger:** None expected.

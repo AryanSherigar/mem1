@@ -208,5 +208,43 @@ class SchemaCompactionTests(unittest.TestCase):
         self.assertIn('"properties"', sent2)
 
 
+class JsonRecoveryTests(unittest.TestCase):
+    """`response_format: json_object` does not guarantee a clean body. Observed
+    live and deterministically (6/6 calls) from Bedrock's openai.gpt-oss-20b: a
+    spurious `{"` prefix, i.e. `{"{"facts":[...]}`."""
+
+    def test_recovers_bedrock_quote_brace_prefix(self) -> None:
+        from context_memory.core.llm_client import _recover_json_object
+        out = _recover_json_object('{"{"facts":[{"text":"a"}]}')
+        self.assertEqual(json.loads(out), {"facts": [{"text": "a"}]})
+
+    def test_recovers_fences_prose_and_double_brace(self) -> None:
+        from context_memory.core.llm_client import _recover_json_object
+        for raw in (
+            '```json\n{"ok":true}\n```',
+            'Here you go:\n{"ok":true}',
+            '{"ok":true}\nHope that helps!',
+            '{{"ok":true}',
+        ):
+            self.assertEqual(json.loads(_recover_json_object(raw)), {"ok": True}, raw)
+
+    def test_clean_json_is_returned_unchanged(self) -> None:
+        from context_memory.core.llm_client import _recover_json_object
+        clean = '{"facts":[{"text":"a"}]}'
+        self.assertEqual(_recover_json_object(clean), clean)
+
+    def test_unrecoverable_text_falls_through_to_error_path(self) -> None:
+        """Must return the input rather than raise, so the caller still reports
+        the real provider output instead of a recovery-layer error."""
+        from context_memory.core.llm_client import _recover_json_object
+        self.assertEqual(_recover_json_object("no json at all"), "no json at all")
+
+    def test_malformed_response_is_parsed_end_to_end(self) -> None:
+        completions = _Completions(fail_times=0)
+        completions.create = lambda **kw: _Response('{"{"ok":true}')  # type: ignore[method-assign]
+        client = _client(completions)
+        self.assertTrue(client.structured_completion("sys", "usr", _Schema).ok)
+
+
 if __name__ == "__main__":
     unittest.main()
