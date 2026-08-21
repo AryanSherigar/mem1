@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from collections.abc import Sequence
 from typing import Any
 from pydantic import BaseModel
 
@@ -29,6 +31,12 @@ class ScoredFact:
     composite_score: float = 0.0
     speaker: str | None = None
     observed_at: int | None = None
+    # 1-indexed rank within each channel's own result list -- None means the
+    # fact did not appear in that channel at all. Captured at seeding time
+    # (the SQL already returns rows in rank order) so Phase 3 can fuse by
+    # Reciprocal Rank Fusion instead of summing raw, differently-scaled scores.
+    semantic_rank: int | None = None
+    keyword_rank: int | None = None
 
 
 class DateRange(BaseModel):
@@ -124,12 +132,18 @@ class HybridRetrievalEngine:
     def retrieve_and_answer(self, context_id: str, question: str, question_date: datetime, top_k: int | None = None) -> str:
         top_k = top_k if top_k is not None else self._config.retrieval_top_k
         with timed_operation(logger, "retrieval.retrieve_and_answer", {"context_id": context_id, "question_len": len(question)}) as ctx:
-            # Phase 0: Temporal Resolution & Query Rewriting
+            # Phase 0: Temporal Resolution & Query Rewriting. Two independent
+            # LLM calls -- the rewriter doesn't use temporal_bounds and the
+            # resolver doesn't use expanded_query -- run concurrently rather
+            # than one after the other; each is a real network round trip, so
+            # this halves Phase 0's wall time for free.
             resolver = TemporalQueryResolver(self._temporal_resolver_client, self._config)
-            temporal_bounds = resolver.resolve(question, question_date)
-
             rewriter = QueryRewriter(self._query_rewriter_client, self._config)
-            expanded_query = rewriter.rewrite(question)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                temporal_future = pool.submit(resolver.resolve, question, question_date)
+                rewriter_future = pool.submit(rewriter.rewrite, question)
+                temporal_bounds = temporal_future.result()
+                expanded_query = rewriter_future.result()
 
             # Phase 1: Semantic + Keyword Seeding
             seed_facts = self._semantic_and_keyword_seeding(
@@ -157,7 +171,7 @@ class HybridRetrievalEngine:
                     logger.debug("PostgreSQL fallback fact_search_index query skipped: %s", e)
 
             # Phase 3: 4-Factor Composite Scoring & Synthesis
-            answer = self._composite_scoring_and_synthesis(question, seed_facts, graph_data, top_k, expanded_query)
+            answer = self._composite_scoring_and_synthesis(question, seed_facts, graph_data, top_k, expanded_query, context_id)
             ctx["answer_len"] = len(answer)
             return answer
 
@@ -183,14 +197,15 @@ class HybridRetrievalEngine:
                     """,
                     (vector_literal, context_id, limit)
                 )
-                for row in cursor.fetchall():
+                for position, row in enumerate(cursor.fetchall(), start=1):
                     fact_id = str(row[0])
                     distance = float(row[1]) if row[1] is not None else 0.0
                     semantic_score = 1.0 / (1.0 + distance)
                     if fact_id not in facts:
-                        facts[fact_id] = ScoredFact(fact_id, "", semantic_score=semantic_score)
+                        facts[fact_id] = ScoredFact(fact_id, "", semantic_score=semantic_score, semantic_rank=position)
                     else:
                         facts[fact_id].semantic_score = max(facts[fact_id].semantic_score, semantic_score)
+                        facts[fact_id].semantic_rank = min(facts[fact_id].semantic_rank or position, position)
 
             # 2. Keyword Search (BM25). Use websearch_to_tsquery with OR combination and @@ matching
             terms = [t.strip() for t in (expanded_query.synonyms + expanded_query.decomposed_queries + [question]) if t.strip()]
@@ -207,17 +222,20 @@ class HybridRetrievalEngine:
                         """,
                         (search_query_str, context_id, search_query_str, limit)
                     )
+                    position = 0
                     for row in cursor.fetchall():
                         fact_id = str(row[0])
                         raw_text = str(row[1])
                         rank = float(row[2]) if row[2] is not None else 0.0
                         if rank <= 0.0:
                             continue
+                        position += 1  # dense rank over accepted rows only, not the raw fetch
                         keyword_score = rank / (1.0 + rank)
                         if fact_id not in facts:
-                            facts[fact_id] = ScoredFact(fact_id, raw_text, keyword_score=keyword_score)
+                            facts[fact_id] = ScoredFact(fact_id, raw_text, keyword_score=keyword_score, keyword_rank=position)
                         else:
                             facts[fact_id].keyword_score = max(facts[fact_id].keyword_score, keyword_score)
+                            facts[fact_id].keyword_rank = min(facts[fact_id].keyword_rank or position, position)
                             if not facts[fact_id].text:
                                 facts[fact_id].text = raw_text
 
@@ -265,9 +283,21 @@ class HybridRetrievalEngine:
             # fact at a time. A plain (non-UNWIND) MATCH ... OPTIONAL MATCH ...
             # RETURN is fine — only the UNWIND-prefixed combined form was ever
             # rejected.
+            #
+            # Fetched concurrently, not one HTTP round trip after another: this
+            # is a genuine N+1 (one call per seeded fact -- 60-80+ typical, per
+            # the overfetch floor/multiplier) and every call is independent and
+            # read-only. HydraHttpTransport holds no mutable per-call state (see
+            # its own docstring/implementation -- headers/URL are fixed at
+            # construction, each .read() is self-contained), so this has none
+            # of the shared-connection hazard that keeps ingestion's writes
+            # serial (PostgresGraphManifestStore et al. share one psycopg
+            # connection; this is a different transport, a different direction
+            # -- reads, not writes -- and has no such constraint).
             raw_nodes = []
             entity_key_by_fact: dict[str, str] = {}
-            for fact_key, graph_id in graph_id_by_fact_key.items():
+
+            def _fetch_node(fact_key: str, graph_id: int) -> tuple[str, Sequence[dict[str, object]] | None]:
                 node_cypher = f"""
                 MATCH (f {{id: {int(graph_id)}}})
                 OPTIONAL MATCH (f)-[:ABOUT]->(e)
@@ -284,14 +314,24 @@ class HybridRetrievalEngine:
                 try:
                     # graph_id is inlined above (int()-coerced, so not injectable);
                     # no parameters remain to bind.
-                    rows = self._hydra.read(node_cypher, {}, None)
+                    return fact_key, self._hydra.read(node_cypher, {}, None)
                 except Exception as e:
                     logger.warning("HydraDB node query error for %s: %s", fact_key, e)
-                    continue
-                for row in rows:
-                    raw_nodes.append({**row, "fact_key": fact_key})
-                    if row.get("entity_key"):
-                        entity_key_by_fact[fact_key] = row["entity_key"]
+                    return fact_key, None
+
+            with ThreadPoolExecutor(max_workers=self._config.retrieval_graph_fetch_workers) as pool:
+                futures = [
+                    pool.submit(_fetch_node, fact_key, graph_id)
+                    for fact_key, graph_id in graph_id_by_fact_key.items()
+                ]
+                for future in as_completed(futures):
+                    fact_key, rows = future.result()
+                    if rows is None:
+                        continue
+                    for row in rows:
+                        raw_nodes.append({**row, "fact_key": fact_key})
+                        if row.get("entity_key"):
+                            entity_key_by_fact[fact_key] = row["entity_key"]
 
             # Apply Bitemporal filtering in Python
             valid_fact_keys = set()
@@ -433,14 +473,104 @@ class HybridRetrievalEngine:
         text = " ".join(parts).casefold()
         return {token for token in re.findall(r"[a-z0-9]+", text) if len(token) > 2}
 
+    def _sibling_facts(self, context_id: str, fact_ids: list[str], question: str) -> dict[str, str]:
+        """Returns `{fact_id: raw_text}` for facts extracted from the same
+        source turn as any fact in `fact_ids` -- the "neighboring turn" tier
+        of FINAL_ARCHITECTURE.md's ADR-005 progressive evidence expansion
+        (fact+span -> neighboring turn -> full chunk), accepted at design time
+        but never actually implemented until now.
+
+        Why this matters: a single turn is routinely split into several
+        atomic facts at extraction time (by design), and those facts are then
+        scored and ranked *independently* in Phase 3. Traced live: "User sold
+        20 potted herb plants" and "Each potted herb plant was sold for $7.5"
+        come from the same turn, but only the second one scored high enough
+        to reach the reader on its own.
+
+        Selection is Reciprocal-adjacent but not RRF: it's Semantic
+        Continuity-Aware Retrieval (SCAR; Zhong et al. 2026,
+        arxiv.org/abs/2606.16661), chosen over a flat "pull every same-turn
+        fact" or a bare `ORDER BY` after the first version of this method hit
+        a real, measured failure -- a shared LIMIT across every anchor's
+        siblings starved out a needed fact (4 candidates for its own turn,
+        available, but never reached: unrelated turns' siblings filled the
+        cap first because nothing was scored or ordered). A same-turn fact
+        still is not automatically the right one to add -- the actually-
+        missing gold fact can just as easily live in a *different* turn
+        entirely, which no amount of neighbor expansion reaches; the goal
+        here is only to stop within-turn continuity from being either
+        all-or-nothing or arbitrarily ordered.
+
+        SCAR scores each candidate neighbor n of anchor a:
+            S(a,n) = cos(query, n) - lambda * (1 - cos(a, n))
+        and keeps n only if it clears a threshold set *relative to its own
+        anchor's* query relevance:
+            S(a,n) > gamma * cos(query, a)
+        so a weakly-relevant anchor sets a low bar and a strongly-relevant
+        one demands genuinely comparable neighbors, rather than one fixed cut
+        for every fact regardless of how well it matched in the first place.
+        Paper defaults (lambda=0.1, gamma=0.80) are used unchanged -- no
+        tuning data of our own exists yet to justify moving them.
+        """
+        if not fact_ids:
+            return {}
+        vector = self._embedder.embed(question)
+        vector_literal = "[" + ",".join(repr(float(v)) for v in vector) + "]"
+        lam = self._config.retrieval_sibling_continuity_penalty
+        gamma = self._config.retrieval_sibling_relevance_ratio
+
+        with self._pg.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT sibling.subject_id, fsi.raw_text,
+                       (anchor.embedding <=> %s::vector) AS anchor_query_distance,
+                       (sibling.embedding <=> %s::vector) AS sibling_query_distance,
+                       (anchor.embedding <=> sibling.embedding) AS boundary_distance
+                FROM memory_embeddings anchor
+                JOIN memory_embeddings sibling
+                  ON sibling.source_chunk_id = anchor.source_chunk_id
+                 AND sibling.context_id = anchor.context_id
+                 AND sibling.subject_kind = 'fact'
+                 AND sibling.is_active = true
+                JOIN fact_search_index fsi
+                  ON fsi.fact_id = sibling.subject_id AND fsi.is_active = true
+                WHERE anchor.context_id = %s
+                  AND anchor.subject_kind = 'fact'
+                  AND anchor.subject_id = ANY(%s)
+                  AND sibling.subject_id != ALL(%s)
+                """,
+                (vector_literal, vector_literal, context_id, fact_ids, fact_ids),
+            )
+            rows = cursor.fetchall()
+
+        # pgvector's <=> is cosine DISTANCE (0 = identical), so similarity is
+        # (1 - distance). A sibling reachable via more than one anchor in this
+        # batch is scored against each and kept at its best-scoring pairing --
+        # SCAR is defined per anchor-neighbor pair, and there is no reason to
+        # penalize a fact for happening to sit next to two relevant facts
+        # instead of one.
+        best: dict[str, tuple[float, str]] = {}
+        for fact_id, raw_text, anchor_qd, sibling_qd, boundary_d in rows:
+            anchor_relevance = 1.0 - float(anchor_qd)
+            sibling_relevance = 1.0 - float(sibling_qd)
+            score = sibling_relevance - lam * float(boundary_d)
+            if score <= gamma * anchor_relevance:
+                continue
+            fact_id = str(fact_id)
+            if fact_id not in best or score > best[fact_id][0]:
+                best[fact_id] = (score, raw_text)
+
+        ranked = sorted(best.items(), key=lambda kv: -kv[1][0])[: self._config.retrieval_sibling_fact_limit]
+        return {fact_id: text for fact_id, (_, text) in ranked}
+
     def _composite_scoring_and_synthesis(
         self, question: str, facts: dict[str, ScoredFact], graph_data: dict, top_k: int,
-        expanded_query: QueryRewriterOutput | None = None,
+        expanded_query: QueryRewriterOutput | None = None, context_id: str | None = None,
     ) -> str:
         with timed_operation(logger, "retrieval.phase3.scoring_and_synthesis", {"facts_to_score": len(facts)}) as ctx:
             path_cap = self._config.retrieval_structural_path_cap
             boost_cap = self._config.retrieval_entity_boost_cap
-            divisor = self._config.retrieval_composite_score_divisor
+            rrf_k = self._config.retrieval_rrf_k
             query_terms = self._query_entity_terms(question, expanded_query)
 
             for f_id, fact in facts.items():
@@ -473,7 +603,49 @@ class HybridRetrievalEngine:
                 else:
                     fact.entity_boost = 0.0
 
-                fact.composite_score = (fact.semantic_score + fact.keyword_score + fact.structural_score + fact.entity_boost) / divisor
+            # Reciprocal Rank Fusion, not a raw-score sum. The previous formula
+            # added semantic_score, keyword_score, structural_score, and
+            # entity_boost directly -- four differently-scaled signals (a
+            # cosine-derived value, a BM25-derived value, a hop-count-derived
+            # value, a capped constant) where whichever one happened to read
+            # "big" for a given fact dominated the total regardless of how
+            # relevant that fact actually was. That is the same failure shape
+            # already fixed once for entity_boost specifically (query-gating);
+            # RRF fixes it structurally for all four signals at once by fusing
+            # on each fact's RANK POSITION within each channel instead of the
+            # raw score value, which is scale-invariant by construction --
+            # standard k=60 (Cormack et al., "Reciprocal Rank Fusion
+            # Outperforms Condorcet and Individual Rank Learning Methods",
+            # 2009). structural_score/entity_boost are not literal separate
+            # retrieval result lists, so their "rank" is derived by sorting the
+            # candidate set by that score descending; a fact with zero score in
+            # a channel gets no rank and no term from it, the same "absent
+            # means silent, not last-place" rule semantic/keyword already use.
+            structural_rank_by_id = {
+                f.fact_id: position
+                for position, f in enumerate(
+                    sorted((f for f in facts.values() if f.structural_score > 0), key=lambda f: -f.structural_score),
+                    start=1,
+                )
+            }
+            entity_rank_by_id = {
+                f.fact_id: position
+                for position, f in enumerate(
+                    sorted((f for f in facts.values() if f.entity_boost > 0), key=lambda f: -f.entity_boost),
+                    start=1,
+                )
+            }
+
+            def _rrf_term(rank: int | None) -> float:
+                return 1.0 / (rrf_k + rank) if rank is not None else 0.0
+
+            for fact in facts.values():
+                fact.composite_score = (
+                    _rrf_term(fact.semantic_rank)
+                    + _rrf_term(fact.keyword_rank)
+                    + _rrf_term(structural_rank_by_id.get(fact.fact_id))
+                    + _rrf_term(entity_rank_by_id.get(fact.fact_id))
+                )
 
             # Sort facts
             ranked = sorted(facts.values(), key=lambda f: f.composite_score, reverse=True)
@@ -502,7 +674,24 @@ class HybridRetrievalEngine:
                 return self._config.retrieval_abstention_message
 
             top_facts = ranked[:top_k]
+            excluded = ranked[top_k:]
             ctx["top_fact_score"] = top_facts[0].composite_score if top_facts else 0.0
+            ctx["candidates_considered"] = len(ranked)
+            ctx["candidates_excluded"] = len(excluded)
+            # Every traced retrieval miss so far has had the same shape: the
+            # needed fact was seeded and scored, just not high enough to make
+            # this cutoff -- crowded out by a fact that matched the question on
+            # surface wording (e.g. any dollar amount for a "how much" question)
+            # without matching its actual topic. Without this line, finding that
+            # required a one-off diagnostic script re-running the whole pipeline
+            # by hand each time; now it's one log line per query.
+            if top_facts and excluded:
+                logger.info(
+                    "Retrieval: reader window cutoff (top_k=%d) — last included "
+                    "(score=%.3f): %r | first excluded (score=%.3f): %r",
+                    top_k, top_facts[-1].composite_score, (top_facts[-1].text or "")[:80],
+                    excluded[0].composite_score, (excluded[0].text or "")[:80],
+                )
 
             # Format context
             context_blocks = []
@@ -517,6 +706,25 @@ class HybridRetrievalEngine:
                     date_str = "Recent"
                 speaker_str = fact.speaker or "user"
                 context_blocks.append(f"[{date_str} | {speaker_str}]: {fact.text}")
+
+            # Neighboring-turn expansion (ADR-005): pull in every other fact
+            # extracted from the same source turn as a fact that already
+            # earned its place in top_facts. No date/speaker available cheaply
+            # here (would need another join), so these are appended under a
+            # clearly labeled heading rather than interleaved as if they had
+            # been independently ranked -- the reader should treat them as
+            # "also said in the same breath as the fact above", not as
+            # equally-scored top hits.
+            if context_id is not None and self._config.retrieval_sibling_fact_limit > 0:
+                try:
+                    siblings = self._sibling_facts(context_id, [f.fact_id for f in top_facts], question)
+                except Exception as e:
+                    logger.debug("Sibling-fact expansion skipped: %s", e)
+                    siblings = {}
+                if siblings:
+                    ctx["sibling_facts_added"] = len(siblings)
+                    context_blocks.append("[related facts from the same conversation turns]:")
+                    context_blocks.extend(f"- {text}" for text in siblings.values())
 
             context_str = "\n".join(context_blocks)
 

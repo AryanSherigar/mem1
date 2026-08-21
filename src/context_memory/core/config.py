@@ -140,13 +140,35 @@ QUERY_REWRITER_SYSTEM_PROMPT = (
 )
 
 # {context} is substituted at call time (the assembled, ranked evidence block).
+# Two additions here (aggregation, preference-fidelity) target a specific,
+# diagnosed failure pattern, not a general rewrite. Traced against real
+# retrieved context on the 30-instance LongMemEval sample:
+#
+# - multi-session questions ("total I earned", "how many pieces of furniture",
+#   "how old was I when X was born") need combining 2+ facts by sum, count, or
+#   subtraction. Without being told to do this explicitly, the reader either
+#   answered from whichever partial subset of facts it had (internally
+#   consistent, silently wrong) or echoed a single raw fact back instead of
+#   computing what was asked.
+# - single-session-preference questions are graded against a rubric that
+#   wants the answer anchored to a specific prior-stated preference. Without
+#   being told to check for one, the reader sometimes gave a generic,
+#   same-topic-but-unrelated answer even when the specific preference fact
+#   was present in context.
 READER_SYSTEM_PROMPT_TEMPLATE = (
     "You are a memory-grounded assistant. Answer the user's question using only the facts "
     "in the memory context below — do not use outside knowledge or assumptions beyond what "
     "is stated. Each fact is timestamped; if facts conflict, trust the most recent one. If "
-    "the context does not contain enough information to answer, say so plainly instead of "
-    "guessing. Answer directly and concisely, in a natural conversational tone — do not "
-    "restate the context verbatim or mention that you were given a context.\n\n"
+    "the question asks for a total, count, or duration that spans multiple facts, first "
+    "identify every matching fact in the context, then compute the answer from all of them "
+    "— do not answer from a partial subset, and do not return a single fact's value directly "
+    "when the question asks for a combination of several. If the question is asking for a "
+    "recommendation and the context states a specific relevant preference (a prior choice, "
+    "style, constraint, or thing they already liked), your answer must build on that specific "
+    "preference, not just stay on the same general topic. If the context does not contain "
+    "enough information to answer, say so plainly instead of guessing. Answer directly and "
+    "concisely, in a natural conversational tone — do not restate the context verbatim or "
+    "mention that you were given a context.\n\n"
     "Memory context:\n{context}"
 )
 
@@ -270,7 +292,36 @@ class Config:
     embedding_model_version: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL_VERSION", "1"))
 
     # -- Retrieval tuning (FINAL_ARCHITECTURE.md §12) ----------------------
-    retrieval_top_k: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_TOP_K", "15")))
+    # 15 -> 20. Every traced multi-session/preference retrieval miss on the
+    # 30-instance LongMemEval sample had the same shape: the needed fact was
+    # seeded and scored, just outside this cutoff, crowded out by a fact that
+    # matched the question's wording (e.g. any dollar figure for a "how much"
+    # question) without matching its actual topic. This doesn't fix the
+    # underlying ranking-relevance gap (see retrieval.phase3's cutoff-boundary
+    # log line, added alongside this change, for that diagnosis going
+    # forward) -- it's a cheap, low-risk mitigation: a wider reader window
+    # gives near-miss facts more room to still get seen while the real ranking
+    # fix (surface-similarity vs topical-relevance) is designed properly.
+    retrieval_top_k: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_TOP_K", "20")))
+    # Neighboring-turn expansion (ADR-005's accepted-but-never-implemented
+    # "fact + span -> neighboring turn -> full chunk" tier). Traced live: a
+    # question needing "20 potted herb plants" x "$7.5 each" got the price but
+    # not the quantity, because the extraction prompt splits one turn into
+    # several atomic facts and Phase 3 scores them independently -- pulling in
+    # every other fact from the same source turn as an already-relevant one
+    # re-unites what extraction split apart. 0 disables it entirely.
+    retrieval_sibling_fact_limit: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_SIBLING_FACT_LIMIT", "20")))
+    # SCAR (Semantic Continuity-Aware Retrieval; Zhong et al. 2026,
+    # arxiv.org/abs/2606.16661) scores which siblings actually earn a spot,
+    # rather than an unordered LIMIT -- confirmed live this mattered: a needed
+    # sibling (4 candidates for its own turn) lost out to unrelated turns'
+    # siblings under a shared, unordered cap. lambda penalizes a candidate for
+    # being semantically distant from the fact that pulled it in; gamma sets
+    # the bar a candidate must clear *relative to its own anchor's* query
+    # relevance (a weak anchor -> a low bar; a strong anchor -> a high one).
+    # Paper defaults, unchanged -- no tuning data of our own exists yet.
+    retrieval_sibling_continuity_penalty: float = field(default_factory=lambda: float(os.getenv("RETRIEVAL_SIBLING_CONTINUITY_PENALTY", "0.1")))
+    retrieval_sibling_relevance_ratio: float = field(default_factory=lambda: float(os.getenv("RETRIEVAL_SIBLING_RELEVANCE_RATIO", "0.80")))
     retrieval_overfetch_multiplier: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_OVERFETCH_MULTIPLIER", "4")))
     retrieval_overfetch_floor: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_OVERFETCH_FLOOR", "60")))
     retrieval_chat_ttl_hours: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_CHAT_TTL_HOURS", "24")))
@@ -283,14 +334,28 @@ class Config:
     # for mostly-noise recall. 3 still reaches one shared-entity hop past the
     # seed set.
     retrieval_graph_max_hops: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_GRAPH_MAX_HOPS", "3")))
+    # Phase 2 fetches one fact's graph node per HydraDB HTTP call (a genuine
+    # N+1 -- HydraDB rejects UNWIND-batched reads, see retrieval.py's own
+    # comments), so a retrieval with the overfetch floor's ~60-80 seeded facts
+    # was ~60-80 sequential round trips. Concurrent, since each call is
+    # independent/read-only and the local HydraDB HTTP transport holds no
+    # shared per-call state. 8 matches the same default already used for
+    # concurrent extraction prefetch in benchmark_runner.py.
+    retrieval_graph_fetch_workers: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_GRAPH_FETCH_WORKERS", "8")))
     retrieval_structural_path_cap: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_STRUCTURAL_PATH_CAP", "3")))
     retrieval_entity_boost_cap: float = field(default_factory=lambda: float(os.getenv("RETRIEVAL_ENTITY_BOOST_CAP", "0.5")))
-    # Cosmetic normalizer only: composite_score is a monotonic sum divided by a
-    # constant, so it never changes ranking order, only the reported number's
-    # scale. 3.5 matches the true max of the sum it divides (semantic<=1 +
-    # keyword<=1 + structural<=1 + entity_boost<=0.5) so a maxed-out fact reads
-    # as ~1.0 instead of ~1.17.
-    retrieval_composite_score_divisor: float = field(default_factory=lambda: float(os.getenv("RETRIEVAL_COMPOSITE_SCORE_DIVISOR", "3.5")))
+    # Composite scoring fuses semantic/keyword/structural/entity by Reciprocal
+    # Rank Fusion (rank position within each channel, not raw score value) --
+    # replaced a raw weighted sum of the four differently-scaled scores, which
+    # let whichever one happened to read numerically "big" for a fact dominate
+    # regardless of actual relevance (confirmed live and repeatedly on
+    # LongMemEval traces: a topically-irrelevant fact with a coincidentally
+    # high semantic/entity score routinely outranked the fact that actually
+    # answered the question). 60 is RRF's standard constant (Cormack et al.
+    # 2009); lower values weight top-ranked-in-any-single-channel facts more
+    # heavily, higher values flatten the fusion toward facts that rank
+    # decently across several channels rather than winning any one of them.
+    retrieval_rrf_k: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_RRF_K", "60")))
     retrieval_abstention_semantic_threshold: float = field(
         default_factory=lambda: float(os.getenv("RETRIEVAL_ABSTENTION_SEMANTIC_THRESHOLD", "0.3"))
     )

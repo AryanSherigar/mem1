@@ -356,48 +356,69 @@ PYTHONPATH=src .venv/bin/python src/evaluation/benchmark_runner.py \
 Predictions were scored with the official grader (`xiaowu0162/LongMemEval`'s
 `src/evaluation/evaluate_qa.py`, judge model `deepseek.v3.2`) against a
 5-instances-per-category sample (fixed random seed, reproducible) drawn from
-the six LongMemEval-S question types. Of the 30 sampled instances, **19 had
-fully completed** by the time of this run (no partial/failed ingestion jobs,
-no fallback-abstention placeholder) — only those 19 are scored below; the
-remaining 11 were still mid-ingestion.
+all six LongMemEval-S question types. All 30 sampled instances **fully
+completed** ingestion (verified: turn count in the source data equals
+ingestion-job count equals completed-job count, exactly, for every instance —
+no partial/failed jobs, no fallback-abstention placeholder) and are scored
+below.
 
 | category | accuracy | n |
 |---|---:|---:|
-| knowledge-update | 60.0% | 5 |
+| single-session-user | 80.0% | 5 |
 | single-session-assistant | 60.0% | 5 |
+| knowledge-update | 60.0% | 5 |
+| temporal-reasoning | 40.0% | 5 |
+| single-session-preference | 0.0% | 5 |
 | multi-session | 0.0% | 5 |
-| single-session-preference | 0.0% | 4 |
-| **overall** | **31.6%** | **19** |
+| **overall** | **40.0%** | **30** |
 
-**Known failure modes, diagnosed against real retrieved context (not
-inferred):**
+An earlier partial read (19/30, before `single-session-user` and
+`temporal-reasoning` had finished ingesting) showed 31.6% — the missing
+categories were pulling the average down by their absence, not by scoring
+badly; `single-session-user` turned out to be the strongest category once
+included. Worth knowing if comparing against an earlier number from this same
+project.
 
-- **`multi-session` (0/5):** every traced failure had the needed facts
-  correctly *ingested*, and in some cases correctly *retrieved*, but the
-  question requires aggregating several facts into one answer (summing
-  amounts across sessions, counting distinct events) and the reader returned
-  a partial total from whichever subset of facts it saw, with no built-in
-  step that enumerates all matching facts before computing. Example: a
-  question asking for total market earnings had all three contributing facts
-  ingested ($225 + $150 + $120 = $495 gold); one of them (the $7.5/unit price
-  needed to compute the $150 component) ranked just outside the top-15 the
-  reader sees, crowded out by unrelated dollar-amount facts (real-estate
-  prices, gross income) that scored higher on surface similarity to "money."
-  The reader answered $345 from the two facts it had — internally consistent,
-  externally wrong. This is a retrieval-ranking and reader-synthesis gap, not
-  an ingestion gap.
-- **`single-session-preference` (0/4):** graded against a rubric, not an
-  exact answer, so a partially-relevant response can still fail. One traced
-  case mentioned the right preference keywords but padded the answer with
-  off-topic content (Wi-Fi signal advice bleeding into a furniture-styling
-  question), diluting it past what the rubric wanted.
+**The two zero-score categories were fully diagnosed, not just observed —
+every one of the 10 instances was traced against its actual ingested data and
+actual retrieved context, and the ingestion itself was independently verified
+as complete and real (thousands of extracted facts per instance, not empty or
+stub output) before looking anywhere else.**
+
+- **`multi-session` (0/5), one root cause across all five, in two shapes:**
+  every instance requires *deriving* an answer from two or more separate
+  facts (summing amounts, counting distinct events, or subtracting two ages)
+  — the reader has no structured step for this and either (a) computes from
+  whichever partial subset of facts survived ranking, or (b) returns a single
+  raw fact directly without attempting the derivation at all. Example of (a):
+  a total-earnings question had all three contributing facts ingested ($225 +
+  $150 + $120 = $495 gold), but the $7.5/unit price needed for the $150
+  component ranked just outside the top-15 the reader sees, crowded out by
+  unrelated dollar-amount facts (real-estate prices, gross income) that
+  scored higher on surface similarity to "money" — the reader answered $345
+  from the two facts it had, internally consistent, externally wrong.
+  Example of (b): "how old was I when Alex was born" (gold: 32 − 21 = 11) —
+  both ages were ingested facts, but the reader just echoed Alex's own age
+  (21) back rather than subtracting. One instance's original failure did not
+  reproduce identically on rerun against the same static data (a different,
+  still-wrong answer came back) — a genuine reader-side non-determinism
+  component on top of the structural gap, not purely a retrieval defect.
+- **`single-session-preference` (0/5), rubric-graded rather than exact-match,
+  two shapes:** the specific preference fact needed didn't reach the reader's
+  top-15 (a "homegrown ingredients" question never saw the one fact about
+  what was actually grown, despite it being ingested); or the fact *was*
+  available and the reader answered generically anyway, ignoring it (a
+  coffee-creamer question whose gold rubric wanted variations on an existing
+  stated recipe plus cost/sugar goals got a same-topic but unrelated new
+  recipe instead).
 
 Neither failure mode is a crash, a dropped fact, or a scoring bug — both are
-the system answering confidently from an incomplete or diluted context. See
-`docs/decisions.md` for the fixes already made this pass (entity-boost
-query-gating, common-noun entity coverage, speaker/entity namespace
-collision) and the ones still open (aggregation-aware reader synthesis,
-relevance-vs-surface-similarity ranking).
+the system answering confidently from an incomplete, diluted, or
+un-aggregated context. See `docs/decisions.md` for the ADR-level rationale
+and `docs/fixes_and_evaluation_findings.md` for the full fix list (including
+RRF composite scoring and sibling-fact expansion, added after this table was
+last measured) plus the complete per-instance diagnosis behind every number
+above.
 
 ---
 
