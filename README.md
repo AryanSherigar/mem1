@@ -22,6 +22,7 @@ Designed for production agentic applications and rigorous contextual benchmarks 
   - [2. FastAPI REST Server](#2-fastapi-rest-server)
   - [3. Interactive CLI Chat REPL](#3-interactive-cli-chat-repl)
   - [4. LongMemEval Benchmark Runner](#4-longmemeval-benchmark-runner)
+    - [Results (LongMemEval-S, stratified 30-instance sample)](#results-longmemeval-s-stratified-30-instance-sample)
   - [5. Manual End-to-End Test Suite](#5-manual-end-to-end-test-suite)
 - [Core Concepts & Mechanics](#-core-concepts--mechanics)
   - [4-Axis Bitemporal Model](#4-axis-bitemporal-model)
@@ -349,6 +350,54 @@ PYTHONPATH=src .venv/bin/python src/evaluation/benchmark_runner.py \
 - `--output`: Path for output predictions JSONL (`{"question_id": "...", "hypothesis": "..."}`).
 - `--extractor`: `llm` (uses configured LLM) or `deterministic` (uses benchmark baseline).
 - `--limit` / `--offset`: For batching evaluations.
+
+#### Results (LongMemEval-S, stratified 30-instance sample)
+
+Predictions were scored with the official grader (`xiaowu0162/LongMemEval`'s
+`src/evaluation/evaluate_qa.py`, judge model `deepseek.v3.2`) against a
+5-instances-per-category sample (fixed random seed, reproducible) drawn from
+the six LongMemEval-S question types. Of the 30 sampled instances, **19 had
+fully completed** by the time of this run (no partial/failed ingestion jobs,
+no fallback-abstention placeholder) — only those 19 are scored below; the
+remaining 11 were still mid-ingestion.
+
+| category | accuracy | n |
+|---|---:|---:|
+| knowledge-update | 60.0% | 5 |
+| single-session-assistant | 60.0% | 5 |
+| multi-session | 0.0% | 5 |
+| single-session-preference | 0.0% | 4 |
+| **overall** | **31.6%** | **19** |
+
+**Known failure modes, diagnosed against real retrieved context (not
+inferred):**
+
+- **`multi-session` (0/5):** every traced failure had the needed facts
+  correctly *ingested*, and in some cases correctly *retrieved*, but the
+  question requires aggregating several facts into one answer (summing
+  amounts across sessions, counting distinct events) and the reader returned
+  a partial total from whichever subset of facts it saw, with no built-in
+  step that enumerates all matching facts before computing. Example: a
+  question asking for total market earnings had all three contributing facts
+  ingested ($225 + $150 + $120 = $495 gold); one of them (the $7.5/unit price
+  needed to compute the $150 component) ranked just outside the top-15 the
+  reader sees, crowded out by unrelated dollar-amount facts (real-estate
+  prices, gross income) that scored higher on surface similarity to "money."
+  The reader answered $345 from the two facts it had — internally consistent,
+  externally wrong. This is a retrieval-ranking and reader-synthesis gap, not
+  an ingestion gap.
+- **`single-session-preference` (0/4):** graded against a rubric, not an
+  exact answer, so a partially-relevant response can still fail. One traced
+  case mentioned the right preference keywords but padded the answer with
+  off-topic content (Wi-Fi signal advice bleeding into a furniture-styling
+  question), diluting it past what the rubric wanted.
+
+Neither failure mode is a crash, a dropped fact, or a scoring bug — both are
+the system answering confidently from an incomplete or diluted context. See
+`docs/decisions.md` for the fixes already made this pass (entity-boost
+query-gating, common-noun entity coverage, speaker/entity namespace
+collision) and the ones still open (aggregation-aware reader synthesis,
+relevance-vs-surface-similarity ranking).
 
 ---
 
